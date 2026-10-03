@@ -37,10 +37,12 @@ object CFDomains {
     var bases: List<String> = builtinBases
         private set
 
-    /// Мердж скачанного списка: встроенные первыми, новые дописываются
-    /// в конец. Меньше 3 валидных доменов — игнор (битый файл).
+    /// Устанавливает набор экстра-фронтов (замена, не мердж: FrontsUpdater
+    /// сам решает, что оставить, что добавить, что выселить — именно он
+    /// держит память живости). Встроенные — ВСЕГДА в начале: это fallback,
+    /// который не зависит ни от сети, ни от реестра. Меньше 3 в наборе —
+    /// только встроенные (пустой реестр = первое включение).
     fun update(new: List<String>) {
-        if (new.size < 3) return
         val merged = builtinBases.toMutableList()
         for (d in new) if (d !in merged) merged += d
         bases = merged

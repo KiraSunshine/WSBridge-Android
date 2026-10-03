@@ -82,13 +82,22 @@ class WSClient(private val tag: String = "") {
 
         /// Кэш здоровья эндпоинтов: упавший (timeout/ошибка до первых данных)
         /// исключается из каскадов на 10 минут. Ключ = IP для прямых, host для доменных.
+        /// Одновременно ПАМЯТЬ реестра: фейлы/успехи уходят во FrontsUpdater —
+        /// живость фронтов переживает рестарт и влияет на вход в каскад.
+        /// Чужие ключи (IP, kws*.web.telegram.org) реестр просто игнорирует.
         private val deadUntil = HashMap<String, Long>()
 
         @Synchronized
-        fun markDead(key: String) { deadUntil[key] = System.currentTimeMillis() + 600_000 }
+        fun markDead(key: String) {
+            deadUntil[key] = System.currentTimeMillis() + 600_000
+            FrontsUpdater.recordFailure(key)
+        }
 
         @Synchronized
-        fun markAlive(key: String) { deadUntil.remove(key) }
+        fun markAlive(key: String) {
+            deadUntil.remove(key)
+            FrontsUpdater.recordSuccess(key)
+        }
 
         @Synchronized
         private fun aliveOnly(eps: List<Endpoint>): List<Endpoint> {

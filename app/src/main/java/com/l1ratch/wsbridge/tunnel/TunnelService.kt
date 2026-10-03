@@ -291,6 +291,9 @@ class TunnelService : VpnService() {
     private fun stopTunnel() {
         if (stopped && tunIn == null) { stopSelf(); return }
         EventLog.append("tunnel_stop:user:pkts=$packetCount")
+        // Память живости фронтов — на диск до смерти сервиса (процесс может
+        // быть убит системой сразу после stopSelf).
+        FrontsUpdater.persist()
         TunnelManager.updateRunning(false)
         stopped = true
         lwipExecutor?.let { ex ->
@@ -320,6 +323,7 @@ class TunnelService : VpnService() {
     override fun onRevoke() {
         // Система отзывает VPN (пользователь выключил в настройках / другой VPN).
         EventLog.append("tunnel_stop:revoked:pkts=$packetCount")
+        FrontsUpdater.persist()
         TunnelManager.updateRunning(false)
         stopped = true
         runCatching { lwipExecutor?.shutdownNow() }
