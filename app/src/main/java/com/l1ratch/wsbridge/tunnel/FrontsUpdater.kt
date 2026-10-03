@@ -5,6 +5,7 @@ import android.content.SharedPreferences
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.net.HttpURLConnection
+import java.net.InetAddress
 import java.net.URL
 
 /// Hot-обновление списка CF-фронтов: качает свежий список апстрима,
@@ -41,6 +42,10 @@ object FrontsUpdater {
     }
 
     /// Скачивает и сохраняет. true = список обновлён.
+    /// Резолвит домены ДО сохранения: файл апстрима бывает протухшим (все
+    /// 20 свежих доменов — NXDOMAIN, проверено 03.10), и мёртвые фронты
+    /// в каскаде жрут 5с таймаута каждый на первой же сессии. Мёртвые
+    /// отбрасываются, живые — мерджатся.
     suspend fun update(): Boolean = withContext(Dispatchers.IO) {
         for (u in urls) {
             val text = try {
@@ -53,11 +58,22 @@ object FrontsUpdater {
                 .filter { it.matches(domainRegex) }
                 .distinct()
             if (domains.size < MIN_DOMAINS) continue // битый файл
-            prefs.edit().putString("fronts", domains.joinToString("\n")).apply()
+            val alive = domains.filter { resolves(it) }
+            if (alive.size < MIN_DOMAINS) continue // все мертвы — файл протух, игнор
+            prefs.edit().putString("fronts", alive.joinToString("\n")).apply()
             prefs.edit().putLong("frontsUpdatedAt", System.currentTimeMillis()).apply()
-            CFDomains.update(domains)
+            CFDomains.update(alive)
             return@withContext true
         }
+        false
+    }
+
+    /// Жив ли домен: DNS-резолв. NXDOMAIN = мёртв (бросает исключение).
+    /// Мы уже на Dispatchers.IO — блокирующий вызов уместен. 20 доменов
+    /// × мгновенный NXDOMAIN = пренебрежимо.
+    private fun resolves(domain: String): Boolean = try {
+        InetAddress.getByName(domain) != null
+    } catch (_: Exception) {
         false
     }
 

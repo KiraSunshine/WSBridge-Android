@@ -220,7 +220,16 @@ class TunnelService : VpnService() {
                 val n = try {
                     input.read(buf)
                 } catch (e: Exception) {
-                    if (!stopped) Log.e(TAG, "tun read failed: ${e.message}")
+                    if (!stopped) {
+                        // TUN умер без onRevoke: система закрыла fd или ядро
+                        // дропнуло интерфейс. Журнал и сброс статуса — иначе
+                        // кнопка вечно показывает «включено», хотя туннеля нет
+                        // (журнал тестера 23:48 обрывался после fronts:40d
+                        // без io: и без причины).
+                        Log.e(TAG, "tun read failed: ${e.message}")
+                        EventLog.append("tun_dead:read:${e.javaClass.simpleName}:${e.message}")
+                        TunnelManager.updateRunning(false)
+                    }
                     break
                 }
                 if (n <= 0) continue
