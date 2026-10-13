@@ -97,12 +97,16 @@ The endpoint list is hot-updatable without rebuilding the app:
 
 ## DNS
 
-DNS from inside the tunnel is forwarded as plain UDP:53 by
-`DNSForwarder` to the selected server — lwIP has no UDP of its own.
-Presets (system / Google / Cloudflare / Comss.one / Malw.link) and custom
-plain-IP servers are configurable in-app; DoH/DoT are deliberately not
-ported (encrypted DNS is the job of the system private DNS). Changes take
-effect on the next tunnel start.
+DNS from inside the tunnel is forwarded by `DNSForwarder`. Priority:
+**DoH** (DNS-over-HTTPS, RFC 8484 wire format over HTTPS POST) if the
+selected server has a DoH URL configured, falling back to **plain UDP:53**
+otherwise. Without DoH, geo-blocks at the DNS layer cannot be bypassed —
+the provider sees the query on port 53 and can poison the response or
+block it outright.
+
+Presets (system / Google / Cloudflare / Comss.one / Malw.link) ship with
+DoH URLs; custom plain-IP servers are also supported. Changes take effect
+on the next tunnel start.
 
 ## Install
 
@@ -134,9 +138,8 @@ manual uninstall — those were signed with a random key.)
 - no IPC layer (Darwin notifications, JournalServer): the service and the
   UI share one process, the journal is read directly;
 - the DNS forwarder is live (on iOS the system NEDNSSettings replaced it;
-  there it was dead code);
-- DoH/DoT presets are not ported: queries go plain UDP:53 from the tunnel;
-  encrypted DNS is the job of the system private DNS;
+  there it was dead code); DoH is implemented in-app via OkHttp (RFC 8484)
+  instead of relying on the system private DNS;
 - the DC index is taken from the destination address and `dc_idx` is
   rewritten in the init (the Android client leaves those bytes random
   without a proxy secret; iOS writes them always).

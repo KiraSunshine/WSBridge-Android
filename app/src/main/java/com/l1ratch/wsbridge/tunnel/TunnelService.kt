@@ -152,7 +152,9 @@ class TunnelService : VpnService() {
             Thread(r, "wsb-lwip").apply { isDaemon = true }
         }
         dnsForwarder =
-            if (dns.servers.isNotEmpty()) DNSForwarder(dns.servers) { pkt -> writePacket(pkt) } else null
+            if (dns.servers.isNotEmpty() || dns.dohURL != null) {
+                DNSForwarder(dns.servers, dns.dohURL) { pkt -> writePacket(pkt) }
+            } else null
 
         setupLWIP(workerDomain)
         startTimers()

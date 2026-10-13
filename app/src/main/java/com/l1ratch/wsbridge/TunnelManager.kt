@@ -21,19 +21,20 @@ object TunnelManager {
         val id: String,
         val name: String,
         val description: String,
-        val servers: List<String>,   // IP-адреса
+        val servers: List<String>,   // IP-адреса для plain UDP:53
+        val dohURL: String? = null,  // DNS-over-HTTPS endpoint (приоритет над servers)
         val isPreset: Boolean,
     )
 
     /// Пресеты — не удаляются, не редактируются.
-    /// DoH/DoT iOS-пресетов на Android не нужны: запросы идут из туннеля
-    /// plain UDP:53 на server IP, шифрование DNS — задача отдельного VPN-режима.
+    /// Приоритет резолвера: DoH > plain UDP:53. Без DoH гео-блокировки по DNS
+    /// не обходятся (провайдер видит запрос и может отравить ответ).
     val dnsPresets = listOf(
-        DNSConfig("system", "Системный", "DNS устройства (туннель не перехватывает DNS)", emptyList(), true),
-        DNSConfig("google", "Google", "Быстрый, надёжный, без фильтрации", listOf("8.8.8.8", "8.8.4.4"), true),
-        DNSConfig("cloudflare", "Cloudflare", "Быстрый, приватный, без фильтрации", listOf("1.1.1.1", "1.0.0.1"), true),
-        DNSConfig("comss", "Comss.one", "Доступ к ИИ, блокировка рекламы, счетчиков, вредоносных сайтов и фишинга", listOf("83.220.169.155", "212.109.195.93"), true),
-        DNSConfig("malw", "Malw.link", "Разблокирует недоступные сайты, блокирует мусор.", listOf("95.216.204.218", "80.253.249.40"), true),
+        DNSConfig("system", "Системный", "DNS устройства (туннель не перехватывает DNS)", emptyList(), null, true),
+        DNSConfig("google", "Google", "Быстрый, надёжный, без фильтрации", listOf("8.8.8.8", "8.8.4.4"), "https://dns.google/dns-query", true),
+        DNSConfig("cloudflare", "Cloudflare", "Быстрый, приватный, без фильтрации", listOf("1.1.1.1", "1.0.0.1"), "https://cloudflare-dns.com/dns-query", true),
+        DNSConfig("comss", "Comss.one", "Доступ к ИИ, блокировка рекламы, счетчиков, вредоносных сайтов и фишинга", listOf("83.220.169.155", "212.109.195.93"), "https://dns.comss.one/dns-query", true),
+        DNSConfig("malw", "Malw.link", "Разблокирует недоступные сайты, блокирует мусор.", listOf("95.216.204.218", "80.253.249.40"), "https://dns.malw.link/dns-query", true),
     )
 
     private lateinit var prefs: SharedPreferences
@@ -68,6 +69,7 @@ object TunnelManager {
                         name = o.getString("name"),
                         description = o.optString("description"),
                         servers = o.getJSONArray("servers").let { s -> (0 until s.length()).map { s.getString(it) } },
+                        dohURL = o.optString("dohURL").takeIf { it.isNotEmpty() },
                         isPreset = false,
                     )
                 }
@@ -81,6 +83,7 @@ object TunnelManager {
                 arr.put(JSONObject().apply {
                     put("id", c.id); put("name", c.name); put("description", c.description)
                     put("servers", JSONArray(c.servers))
+                    if (c.dohURL != null) put("dohURL", c.dohURL)
                 })
             }
             prefs.edit().putString("customDNS", arr.toString()).apply()

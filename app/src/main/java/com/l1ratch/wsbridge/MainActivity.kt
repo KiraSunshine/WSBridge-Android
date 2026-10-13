@@ -464,7 +464,7 @@ private fun DnsManageScreen(navigate: (String) -> Unit) {
                     Text("Удалить ${config.name}", color = MaterialTheme.colorScheme.error)
                 }
             }
-            OutlinedButton(onClick = { editing = TunnelManager.DNSConfig("", "", "", emptyList(), false) }) {
+            OutlinedButton(onClick = { editing = TunnelManager.DNSConfig("", "", "", emptyList(), null, false) }) {
                 Text("Добавить DNS")
             }
         }
@@ -474,10 +474,10 @@ private fun DnsManageScreen(navigate: (String) -> Unit) {
         DnsEditorDialog(
             initial = config.takeIf { it.id.isNotEmpty() },
             onDismiss = { editing = null },
-            onSave = { name, desc, servers ->
+            onSave = { name, desc, servers, dohURL ->
                 val entry = TunnelManager.DNSConfig(
                     id = if (config.id.isNotEmpty()) config.id else java.util.UUID.randomUUID().toString(),
-                    name = name, description = desc, servers = servers, isPreset = false,
+                    name = name, description = desc, servers = servers, dohURL = dohURL, isPreset = false,
                 )
                 custom = if (config.id.isNotEmpty()) custom.map { if (it.id == entry.id) entry else it }
                 else custom + entry
@@ -500,9 +500,13 @@ private fun DnsRow(config: TunnelManager.DNSConfig, onClick: (() -> Unit)?) {
     ) {
         Column(Modifier.weight(1f)) {
             Text(config.name)
+            val detail = buildString {
+                if (config.dohURL != null) append("DoH · ")
+                if (config.servers.isNotEmpty()) append(config.servers.joinToString(", "))
+                else append(config.description)
+            }
             Text(
-                if (config.servers.isEmpty()) config.description
-                else config.description + " · " + config.servers.joinToString(", "),
+                detail,
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
             )
@@ -520,20 +524,22 @@ private fun DnsRow(config: TunnelManager.DNSConfig, onClick: (() -> Unit)?) {
 private fun DnsEditorDialog(
     initial: TunnelManager.DNSConfig?,
     onDismiss: () -> Unit,
-    onSave: (name: String, description: String, servers: List<String>) -> Unit,
+    onSave: (name: String, description: String, servers: List<String>, dohURL: String?) -> Unit,
 ) {
     var name by remember { mutableStateOf(initial?.name ?: "") }
     var description by remember { mutableStateOf(initial?.description ?: "") }
     var servers by remember { mutableStateOf(initial?.servers?.toMutableList() ?: mutableListOf("")) }
+    var dohURL by remember { mutableStateOf(initial?.dohURL ?: "") }
 
     AlertDialog(
         onDismissRequest = onDismiss,
         confirmButton = {
             TextButton(
                 onClick = {
-                    onSave(name.trim(), description.trim(), servers.map { it.trim() }.filter { it.isNotEmpty() })
+                    val cleanDoh = dohURL.trim().takeIf { it.isNotEmpty() }
+                    onSave(name.trim(), description.trim(), servers.map { it.trim() }.filter { it.isNotEmpty() }, cleanDoh)
                 },
-                enabled = name.isNotBlank() && servers.any { it.isNotBlank() },
+                enabled = name.isNotBlank() && (servers.any { it.isNotBlank() } || dohURL.isNotBlank()),
             ) { Text("Сохранить") }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Отмена") } },
@@ -543,7 +549,20 @@ private fun DnsEditorDialog(
                 OutlinedTextField(name, { name = it }, label = { Text("Название") }, singleLine = true)
                 OutlinedTextField(description, { description = it }, label = { Text("Описание") }, singleLine = true)
                 Spacer(Modifier.height(8.dp))
-                Text("Серверы (IP)", style = MaterialTheme.typography.labelLarge)
+                Text("DoH URL (приоритет)", style = MaterialTheme.typography.labelLarge)
+                OutlinedTextField(
+                    dohURL,
+                    { dohURL = it },
+                    label = { Text("https://dns.example.com/dns-query") },
+                    singleLine = true,
+                )
+                Text(
+                    "DNS-over-HTTPS: запрос шифруется внутри TLS, провайдер не видит домен. Приоритет над plain UDP.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
+                )
+                Spacer(Modifier.height(8.dp))
+                Text("Серверы (IP, fallback)", style = MaterialTheme.typography.labelLarge)
                 servers.forEachIndexed { i, server ->
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         OutlinedTextField(
@@ -567,7 +586,7 @@ private fun DnsEditorDialog(
                 }
                 TextButton(onClick = { servers = (servers + "").toMutableList() }) { Text("Добавить сервер") }
                 Text(
-                    "Запросы идут plain UDP:53 из туннеля. DoH/DoT на Android не поддерживаются — при необходимости используйте системный private DNS.",
+                    "Plain UDP:53 — fallback если DoH недоступен. Без DoH гео-блокировки по DNS не обходятся.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
                 )

@@ -1,19 +1,37 @@
 package com.l1ratch.wsbridge.tunnel
 
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
+import java.util.concurrent.TimeUnit
 
 /// Перехватывает DNS-запросы (UDP:53) из туннеля и форвардит их на указанные
-/// серверы. На Android это ОБЯЗАТЕЛЬНО: lwIP собран с LWIP_UDP=0, а setDnsServer
+/// серверы. Приоритет: DoH (если задан dohURL) > plain UDP:53.
+///
+/// На Android это ОБЯЗАТЕЛЬНО: lwIP собран с LWIP_UDP=0, а setDnsServer
 /// даёт системному резолверу только один адрес — приложения, резолвящие сами
 /// (Telegram), шлют UDP в TUN и без форвардера умерли бы молча.
-/// Порт DNSForwarder.swift (там он лежал мёртвым кодом — системный DNS iOS
-/// закрывал кейс; здесь закрывает реальный).
+///
+/// Без DoH гео-блокировки по DNS не обходятся: провайдер видит запрос на
+/// порт 53 и может отравить ответ или заблокировать. DoH шифрует запрос
+/// внутри TLS, провайдер видит только HTTPS-трафик к домену резолвера.
 class DNSForwarder(
     private val dnsServers: List<String>,
+    private val dohURL: String? = null,
     private val writePacket: (ByteArray) -> Unit,
 ) {
+    /// OkHttpClient для DoH-запросов. Таймауты короткие — DNS должен быть быстрым.
+    private val httpClient: OkHttpClient by lazy {
+        OkHttpClient.Builder()
+            .connectTimeout(3, TimeUnit.SECONDS)
+            .readTimeout(3, TimeUnit.SECONDS)
+            .build()
+    }
+
     /// Проверяет, является ли пакет DNS-запросом (UDP:53).
     /// Возвращает true если пакет перехвачен и обработан.
     fun tryHandle(packet: ByteArray): Boolean {
@@ -24,22 +42,53 @@ class DNSForwarder(
         val dstPort = ((packet[ihl + 2].toInt() and 0xFF) shl 8) or (packet[ihl + 3].toInt() and 0xFF)
         if (dstPort != 53) return false
         val payload = packet.copyOfRange(ihl + 8, packet.size)
-        if (payload.isEmpty() || dnsServers.isEmpty()) return false
+        if (payload.isEmpty()) return false
 
         // ponytail: свой поток на запрос — DNS-запросов из туннеля единицы
         // (Telegram резолвит DC-адреса редко), пул не нужен.
         Thread({
-            for (server in dnsServers) {
-                val response = query(server, payload) ?: continue
-                writePacket(wrapResponse(response, packet, ihl))
-                return@Thread
+            // Приоритет 1: DoH (если задан).
+            if (dohURL != null) {
+                val response = queryDoH(dohURL, payload)
+                if (response != null) {
+                    writePacket(wrapResponse(response, packet, ihl))
+                    return@Thread
+                }
+                // DoH упал — fallback на plain UDP.
             }
-            EventLog.append("dns:fail:${dnsServers.size}")
+
+            // Приоритет 2: plain UDP:53.
+            if (dnsServers.isNotEmpty()) {
+                for (server in dnsServers) {
+                    val response = queryUDP(server, payload) ?: continue
+                    writePacket(wrapResponse(response, packet, ihl))
+                    return@Thread
+                }
+            }
+
+            EventLog.append("dns:fail:doh=${dohURL != null}:udp=${dnsServers.size}")
         }, "dns-fwd").apply { isDaemon = true }.start()
         return true
     }
 
-    private fun query(server: String, payload: ByteArray): ByteArray? = try {
+    /// DoH-запрос: RFC 8484, DNS wire format over HTTPS POST.
+    /// Content-Type: application/dns-message. Тело — сырой DNS-пакет.
+    private fun queryDoH(url: String, payload: ByteArray): ByteArray? = try {
+        val request = Request.Builder()
+            .url(url)
+            .post(payload.toRequestBody("application/dns-message".toMediaType()))
+            .header("Accept", "application/dns-message")
+            .build()
+        httpClient.newCall(request).execute().use { resp ->
+            if (!resp.isSuccessful) return null
+            resp.body?.bytes()
+        }
+    } catch (_: Exception) {
+        null
+    }
+
+    /// Plain UDP:53 запрос.
+    private fun queryUDP(server: String, payload: ByteArray): ByteArray? = try {
         DatagramSocket().use { sock ->
             sock.soTimeout = 3000
             val addr = InetAddress.getByName(server)
