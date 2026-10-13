@@ -5,7 +5,7 @@ IP-over-WebSocket relay for Android (VpnService). Russian version: [README.ru.md
 ## What it does
 
 The app creates a virtual network interface (TUN) and carries the IPv4
-traffic of Telegram ranges through it as a WebSocket stream:
+traffic of the configured prefixes through it as a WebSocket stream:
 
 ```mermaid
 flowchart LR
@@ -21,8 +21,9 @@ flowchart LR
     WS <-->|"wss:// (TLS) · HTTP 101 upgrade"| GW["Gateway endpoint"]
 ```
 
-1. The system routes Telegram-range IPv4 traffic into the TUN fd
-   (`149.154.0.0/16`, `91.108.0.0/16`, `91.105.192.0/24` — nothing else).
+1. The system routes IPv4 traffic for the configured prefixes into the
+   TUN fd (`149.154.0.0/16`, `91.108.0.0/16`, `91.105.192.0/24` — nothing
+   else is touched).
 2. The vendored lwIP stack (2.2.0, single-threaded, `NO_SYS=1`, IPv4-only)
    terminates TCP and re-emits each flow as WebSocket frames.
 3. Frames travel over TLS (`wss://`) to an HTTP endpoint that upgrades
@@ -34,14 +35,15 @@ in one process, so the journal and the status are read directly. lwIP has
 no UDP of its own, so DNS from the tunnel is forwarded by `DNSForwarder`
 as plain UDP:53 to the selected server.
 
-The 64-byte MTProto init is parsed on the fly. Telegram Android does not
-embed `dc_idx` into the init without a proxy secret, so the DC is derived
-from the destination address (built-in IP→DC table) and the `dc_idx` bytes
-are rewritten in place (keystream XOR) to match the chosen gateway host.
+The 64-byte obfuscated init header is parsed on the fly. The client does
+not embed `dc_idx` into it without a proxy secret, so the DC index is
+derived from the destination address (built-in IP→DC table) and the
+`dc_idx` bytes are rewritten in place (keystream XOR) to match the chosen
+gateway host.
 
 Additional modes (the "CF Worker" field in the menu):
 - **pipe** — your own Cloudflare Worker: the raw TCP stream goes into WS,
-  the worker connects to the DC itself;
+  the worker connects to the destination itself;
 - **relay** — a direct relay on your VPS: `host:port`, raw TCP, no CF/WS.
 
 ## Endpoint selection
@@ -53,7 +55,7 @@ flowchart TD
     A(["new connection"]) --> B{"persistent health registry<br/>skip: ≥3 consecutive fails and no success in 24 h<br/>order: latest successes first"}
     B --> T1["tier 1 · direct IPs<br/>gateway address for this DC<br/>SNI/Host/cert stay domain-based"]
     T1 -->|fail| T2["tier 2 · CDN edge<br/>kws{dc}.{domain} · round-robin start"]
-    T2 -->|fail| T3["tier 3 · native<br/>kws{dc}.web.telegram.org"]
+    T2 -->|fail| T3["tier 3 · native<br/>kws{dc}.*"]
     T3 -->|fail| X(["abort · client reconnects → new cascade"])
     T1 & T2 & T3 -->|first data received| OK(["session active"])
     OK -.->|"success: failCount = 0, lastSuccess = now"| R[("health registry<br/>SharedPreferences · survives restarts")]
@@ -67,8 +69,8 @@ flowchart TD
   domain-based via a custom DNS resolver.
 - **CDN edge** — `kws{dc}.{domain}` hosts, resolved and rotated
   round-robin; the prefix of live endpoints is preferred.
-- **Native** — `kws{dc}.web.telegram.org` as the final fallback
-  (`kws{dc}-1` for media DCs).
+- **Native** — the `kws{dc}.*` gateway host as the final fallback; the
+  `-1` host variant serves media clusters.
 
 The per-endpoint health registry survives restarts: consecutive failures,
 last failure and last success timestamps. Endpoints with ≥3 consecutive
@@ -135,9 +137,9 @@ manual uninstall — those were signed with a random key.)
   there it was dead code);
 - DoH/DoT presets are not ported: queries go plain UDP:53 from the tunnel;
   encrypted DNS is the job of the system private DNS;
-- the DC is taken from the destination address and `dc_idx` is rewritten
-  in the init (the Android client leaves those bytes random without a
-  proxy secret; iOS writes them always).
+- the DC index is taken from the destination address and `dc_idx` is
+  rewritten in the init (the Android client leaves those bytes random
+  without a proxy secret; iOS writes them always).
 
 ## License
 
