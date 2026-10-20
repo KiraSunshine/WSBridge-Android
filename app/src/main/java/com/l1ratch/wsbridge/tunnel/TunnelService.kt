@@ -20,6 +20,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 
 /// Порт PacketTunnelProvider.swift: TUN fd вместо packetFlow, всё остальное —
 /// lwIP + WS-сплайсинг — без изменений. Перехватывает TCP к DC Telegram,
@@ -56,14 +57,37 @@ class TunnelService : VpnService() {
     private var dnsFd: android.os.ParcelFileDescriptor? = null
     private var dnsForwarder: DNSForwarder? = null
     @Volatile private var stopped = false
+    // starting: старт ЭТОГО поколения ещё в полёте. Ставит владелец попытки,
+    // а снимает тот, кто её отменяет (stopTunnel/onRevoke) — сам отменённый
+    // поток общий флаг не трогает, иначе он погасил бы старт уже НОВОЙ сессии.
+    // Снять его на остановке обязательно: иначе guard `starting || tunIn !=
+    // null` в onStartCommand навсегда отбивал бы ACTION_START, и туннель
+    // нельзя было бы включить заново.
     @Volatile private var starting = false
+
+    // Поколение старта. Каждая попытка захватывает свой номер, и всё, что
+    // поток попытки делает после establish(), сверяется с ним. Номер
+    // инкрементится и на старте, и на любой остановке, поэтому попытка, чьё
+    // establish() вернулось уже после отмены, видит себя устаревшей: она
+    // закрывает свой TUN fd и НЕ трогает статус, executor и сторож — они уже
+    // принадлежат новой сессии. Так «два establish() одновременно» не может
+    // дать два поднятых VPN даже ценой залипания: устаревшая попытка убирает
+    // за собой сама.
+    // AtomicLong, а не ++: инкрементят и main-поток (onStartCommand), и поток
+    // сторожа (abortStalledStart).
+    private val startGen = AtomicLong(0L)
 
     // Сторож старта (iOS build 77): establish() — binder-IPC в system_server,
     // и он может висеть вечно. Оптимистичный updateRunning(true) выше в этом
     // случае оставлял кнопку «включено» навсегда без единой ошибки в журнале.
     // Держим и executor, и задачу: отменённую задачу нужно ещё и погасить,
     // иначе поток останется висеть после снятия сторожа.
+    // startWatchdogGen: чей сторож сейчас взведён. Гасим только своего —
+    // без этого сторож прошлой сессии, чей cancel не успел/не сработал,
+    // выстрелил бы в НОВОЙ сессии: ложный start_stall и снятый статус
+    // (окно, в которое бьёт restartTunnel из UI).
     @Volatile private var startWatchdog: ScheduledFuture<*>? = null
+    @Volatile private var startWatchdogGen = -1L
     private var watchdogExecutor: ScheduledExecutorService? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -83,6 +107,10 @@ class TunnelService : VpnService() {
         // startForeground обязан успеть в 5с после startForegroundService —
         // делаем сразу и на main-потоке (это быстро).
         startInForeground(dns.name)
+
+        // Своя попытка старта: всё, что она сделает после establish(),
+        // сверяется с этим номером, а любая остановка делает её устаревшей.
+        val gen = startGen.incrementAndGet()
 
         // ВСЁ остальное — в фоновом потоке. Сервис и UI живут в одном процессе,
         // а establish() — это binder-IPC в system_server с перенастройкой
@@ -107,40 +135,64 @@ class TunnelService : VpnService() {
             Thread(r, "wsb-watchdog").apply { isDaemon = true }
         }
         watchdogExecutor = watchdog
-        startWatchdog = watchdog.schedule({
-            if (starting) {
-                EventLog.append("start_stall:${START_WATCHDOG_S}s")
-                // Флаг starting СОЗНАТЕЛЬНО не сбрасываем: его сброс открыл бы
-                // повторный ACTION_START и ВТОРОЙ establish() поверх всё ещё
-                // висящего первого — два TUN fd и два контура lwIP.
-                //
-                // ponytail: поэтому залипший навсегда establish() оставляет
-                // сервис неспособным к перезапуску (guard `starting` выше
-                // игнорирует новый START). Лечится выключением VPN в настройках
-                // системы (onRevoke → stopSelf) либо смертью процесса — оба
-                // пути дают чистый инстанс сервиса. Если start_stall появится
-                // в журнале тестера, следующий шаг — stopSelf() в этой ветке.
-                TunnelManager.updateRunning(false)
-            }
-        }, START_WATCHDOG_S, TimeUnit.SECONDS)
+        startWatchdog = watchdog.schedule({ abortStalledStart(gen) }, START_WATCHDOG_S, TimeUnit.SECONDS)
+        startWatchdogGen = gen
         Thread({
             try {
-                startTunnel(workerDomain, dns)
+                startTunnel(workerDomain, dns, gen)
             } catch (t: Throwable) {
                 Log.e(TAG, "tunnel start failed", t)
-                EventLog.append("start_fail:${t.javaClass.simpleName}:${t.message}")
-                starting = false
-                TunnelManager.updateRunning(false)
-                stopForeground(STOP_FOREGROUND_REMOVE)
-                stopSelf()
+                // Своя неудача: падение устаревшей попытки — не наша ошибка,
+                // её start_fail только запутал бы журнал.
+                if (startGen.get() == gen) {
+                    EventLog.append("start_fail:${t.javaClass.simpleName}:${t.message}")
+                    starting = false
+                    TunnelManager.updateRunning(false)
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                    stopSelf()
+                }
             } finally {
-                disarmWatchdog()
+                // Гасим только свой сторож: у новой сессии свой, и трогать его
+                // отсюда нельзя.
+                disarmWatchdog(gen)
             }
         }, "wsb-start").start()
         return START_NOT_STICKY
     }
 
-    private fun startTunnel(workerDomain: String?, dns: TunnelManager.DNSConfig) {
+    /// Сторож старта: попытка `gen` не уложилась в 20с. Задача сторожа — не
+    /// только снять статус, но и сделать сервис пригодным к перезапуску.
+    ///
+    /// Здесь СОЗНАТЕЛЬНО сбрасывается starting. Прежний код не сбрасывал его
+    /// намеренно — чтобы не открыть второй establish() поверх висящего
+    /// первого, — но обратной стороной стало то, что после сторожа сервис
+    /// было не остановить (guard `starting` отбивал ACTION_START, а ACTION_STOP
+    /// из UI недостижим: toggle() смотрит только на running и после сторожа
+    /// шлёт START). Второй establish() и так невозможен: остановка ниже делает
+    /// попытку устаревшей по startGen, а устаревшая в свою очередь не трогает
+    /// общее состояние и закрывает свой TUN fd.
+    ///
+    /// ponytail: stopSelf() НЕ отбирает Android-VPN у system_server. На своей
+    /// остановке сервис сам закрывает свой TUN fd и туннель поднимает только
+    /// система — так и делает stopTunnel(). Здесь же попытка висит ВНУТРИ
+    /// establish(), своего fd у неё ещё нет, и в её потоке лежит VpnService
+    /// (Builder().establish() синхронный): закрывать нечего. Если в logcat
+    /// будет `start_stall` и при этом активный системный VPN — значит
+    /// залипший establish() уже отдал fd в system_server; тогда следующий
+    /// шаг — async `establish()` на отдельный поток, чтобы отмена могла его
+    /// закрыть. Одиночный же VpnService.stopTunnel() дал бы только лишний
+    /// `tunnel_stop:user` в журнале, ничего не развязав.
+    private fun abortStalledStart(gen: Long) {
+        // Сторож прошлой сессии: работа его отменена, новую трогать нельзя.
+        if (startGen.get() != gen) return
+        EventLog.append("start_stall:${START_WATCHDOG_S}s")
+        // Настоящая остановка, а не только статус: сервис умирает, приложение
+        // остаётся живым (сервис и UI в одном процессе), и следующий
+        // ACTION_START из UI поднимает чистую сессию.
+        stopTunnel()
+    }
+
+    private fun startTunnel(workerDomain: String?, dns: TunnelManager.DNSConfig, gen: Long) {
         val tun = Builder()
             .setSession("WSBridge")
             .setMtu(1500)
@@ -162,20 +214,45 @@ class TunnelService : VpnService() {
 
         if (tun == null) {
             Log.e(TAG, "establish() failed (consent revoked?)")
-            EventLog.append("start_fail:establish_null")
-            starting = false
-            TunnelManager.updateRunning(false)
-            stopForeground(STOP_FOREGROUND_REMOVE)
-            stopSelf()
+            // Устаревшая попытка молчит: её отмена уже отчиталась в журнале,
+            // а start_fail от неё читался бы как отказ текущего старта.
+            if (startGen.get() == gen) {
+                EventLog.append("start_fail:establish_null")
+                starting = false
+                TunnelManager.updateRunning(false)
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
+            }
+            return
+        }
+        // Проверка поколения — единственное место, где попытка окончательно
+        // «принимается», и идёт она сразу после establish(): между ней и
+        // первым обращением к общим полям вклиниться уже нечему.
+        if (startGen.get() != gen) {
+            // Попытку отменили, пока establish() висел (сторож, STOP из UI,
+            // onRevoke). Отдавать свой TUN fd общему состоянию нельзя: он
+            // сейчас либо чужой рабочий TUN, либо null у остановленного
+            // сервиса — запись затрёт рабочий контур или оставит вторую
+            // поднятую VPN без владельца. Вместо этого убираем за собой.
+            runCatching { tun.close() }
             return
         }
         if (stopped) { // выключили, пока длился establish
             runCatching { tun.close() }
-            starting = false
+            // starting чужой: сервис уже остановлен, а флаг снимет тот, кто
+            // отменял попытку (stopTunnel/onRevoke). Своё `starting = false`
+            // здесь погасило бы старт новой сессии, если он уже начался.
+            if (startGen.get() == gen) starting = false
             stopSelf()
             return
         }
 
+        // Для общих полей попытка уже «старшая». Но устареть она может и
+        // посреди этого блока: пока она пишет fd и поднимает lwIP, сторож
+        // сессии прошлой мог обнулить startGen. Тогда fd закрывается, а
+        // общий executor в конце не трогается — он принадлежит новой сессии.
+        // Гарантии закрытия достаточно: закрытый fd убьёт поток чтения, и
+        // контур умрёт сам, без двух живых establ().
         dnsFd = tun
         tunIn = FileInputStream(tun.fileDescriptor)
         tunOut = FileOutputStream(tun.fileDescriptor)
@@ -205,12 +282,20 @@ class TunnelService : VpnService() {
                 DNSForwarder(dns.servers, dotHost, dohUrl) { pkt -> writePacket(pkt) }
             } else null
 
+        if (startGen.get() != gen) {
+            // Нас обнулили, пока поднимался контур: не оставляем вторую
+            // поднятую VPN и не трогаем ни статус, ни чужой executor.
+            closeTun()
+            return
+        }
         setupLWIP(workerDomain)
         startTimers()
         readLoop()
+        if (startGen.get() != gen) return
         starting = false
-        // Старт успел уложиться в 20с — сторож больше не нужен.
-        disarmWatchdog()
+        // Старт успел уложиться в 20с — сторож больше не нужен. Только свой:
+        // у новой сессии свой сторож, и погасить его отсюда нельзя.
+        disarmWatchdog(gen)
 
         // Нуджи и мониторинг сети (паритет с iOS startTunnel, где next to
         // startTimers() идут startPathMonitor() и scheduleLongSessionNudge()):
@@ -223,13 +308,62 @@ class TunnelService : VpnService() {
 
     /// Гасит сторож старта независимо от исхода: при штатном старте задача не
     /// должна «выстрелить» позже, при падении — не остаться висеть в очереди.
-    private fun disarmWatchdog() {
+    /// Вызывать разрешено только владельцу поколения: чужой сторож — это сторож
+    /// уже стартовавшей новой сессии, и его отмена оставила бы её без присмотра
+    /// (а её залипший establish() — без сторожа вообще). Общий сторож снимает
+    /// та остановка, которая обнулила поколение.
+    private fun disarmWatchdog(gen: Long) {
+        if (startWatchdogGen != gen) return
+        // ponytail: cancel(false) уже выполняющуюся задачу не гасит — её работу
+        // отсекает проверка поколения внутри abortStalledStart. Именно на это
+        // окно и бьёт restartTunnel из UI.
         startWatchdog?.cancel(false)
         startWatchdog = null
+        startWatchdogGen = -1L
         // ponytail: shutdown() без awaitTermination — ждать нечего, а
         // блокировать main-поток ради служебного потока нельзя.
         watchdogExecutor?.shutdown()
         watchdogExecutor = null
+    }
+
+    /// Остановка сервиса. Зовётся и из UI (ACTION_STOP), и сторожем старта.
+    private fun stopTunnel() {
+        if (stopped && tunIn == null) { stopSelf(); return }
+        EventLog.append("tunnel_stop:user:pkts=$packetCount")
+        // Старт мог ещё идти: гасим сторож, иначе он пальнёт start_stall
+        // уже после осознанной остановки, которую сам же пользователь и сделал.
+        // Обнуляем и поколение: попытка, чей establish() ещё висит, станет
+        // устаревшей — при возврате она только закроет свой fd и не тронет
+        // состояние новой сессии.
+        startGen.incrementAndGet()
+        disarmWatchdog(startWatchdogGen)
+        // Снимаем флаг старта. Без этого guard `starting || tunIn != null` в
+        // onStartCommand навсегда отбивал бы ACTION_START, и выключенный
+        // туннель нельзя было бы включить заново — тот самый залипший сервис.
+        starting = false
+        // Память живости фронтов — на диск до смерти сервиса (процесс может
+        // быть убит системой сразу после stopSelf).
+        FrontsUpdater.persist()
+        // Нудж 6ч и монитор сети снимаем ЗДЕСЬ (как cancelLongSessionNudge в
+        // iOS stopTunnel, который исполняется всегда): напоминание «туннель
+        // давно включён» не должно дожить до момента, когда туннель выключен.
+        NetworkMonitor.stop()
+        NotificationHelper.cancelLongSession(this)
+        TunnelManager.updateRunning(false)
+        stopped = true
+        lwipExecutor?.let { ex ->
+            runCatching {
+                ex.execute {
+                    for (s in sessions.values) s.handleClose(1)
+                    sessions.clear()
+                }
+            }
+            ex.shutdown()
+        }
+        lwipExecutor = null
+        closeTun()
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
     }
 
     private fun setupLWIP(workerDomain: String?) {
@@ -360,37 +494,6 @@ class TunnelService : VpnService() {
         }
     }
 
-    private fun stopTunnel() {
-        if (stopped && tunIn == null) { stopSelf(); return }
-        EventLog.append("tunnel_stop:user:pkts=$packetCount")
-        // Старт мог ещё идти: гасим сторож, иначе он пальнёт start_stall
-        // уже после осознанной остановки, которую сам же пользователь и сделал.
-        disarmWatchdog()
-        // Память живости фронтов — на диск до смерти сервиса (процесс может
-        // быть убит системой сразу после stopSelf).
-        FrontsUpdater.persist()
-        // Нудж 6ч и монитор сети снимаем ЗДЕСЬ (как cancelLongSessionNudge в
-        // iOS stopTunnel, который исполняется всегда): напоминание «туннель
-        // давно включён» не должно дожить до момента, когда туннель выключен.
-        NetworkMonitor.stop()
-        NotificationHelper.cancelLongSession(this)
-        TunnelManager.updateRunning(false)
-        stopped = true
-        lwipExecutor?.let { ex ->
-            runCatching {
-                ex.execute {
-                    for (s in sessions.values) s.handleClose(1)
-                    sessions.clear()
-                }
-            }
-            ex.shutdown()
-        }
-        lwipExecutor = null
-        closeTun()
-        stopForeground(STOP_FOREGROUND_REMOVE)
-        stopSelf()
-    }
-
     /// Закрываем именно ParcelFileDescriptor: его close() гарантированно будит
     /// поток, заблокированный в read(fd) (стрим-обёртки — нет).
     private fun closeTun() {
@@ -403,7 +506,9 @@ class TunnelService : VpnService() {
     override fun onRevoke() {
         // Система отзывает VPN (пользователь выключил в настройках / другой VPN).
         EventLog.append("tunnel_stop:revoked:pkts=$packetCount")
-        disarmWatchdog()
+        // Остановка гасит сторож ТЕКУЩЕГО поколения: своего владельца у него
+        // уже нет (сессия кончилась), а чужой не трогаем — им владеет новая.
+        disarmWatchdog(startWatchdogGen)
         FrontsUpdater.persist()
         // Оба пути остановки обязаны снимать нудж и монитор: onRevoke приходит
         // из system_server и НЕ проходит через stopTunnel, так что без этих
@@ -421,7 +526,7 @@ class TunnelService : VpnService() {
 
     override fun onDestroy() {
         stopped = true
-        disarmWatchdog()
+        disarmWatchdog(startWatchdogGen)
         // Страховка на пути, которые до сюда не дошли (start_fail:*,
         // establish_null, tun_dead): сервис умирает всегда, а монитор сети и
         // нудж 6ч не должны пережить его. Оба вызова идемпотентны.

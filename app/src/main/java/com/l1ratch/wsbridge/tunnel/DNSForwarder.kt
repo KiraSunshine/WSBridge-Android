@@ -4,12 +4,15 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import android.os.SystemClock
 import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.InetSocketAddress
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import javax.net.ssl.SNIHostName
 import javax.net.ssl.SSLSocket
@@ -45,6 +48,14 @@ class DNSForwarder(
             .build()
     }
 
+    /// Пул на всё время жизни форвардера. daemon-потоки: форвардер живёт
+    /// столько же, сколько сервис, и не должен удерживать процесс.
+    /// ponytail: 2 потока, а не кэширующий пул — DNS-запросы редки и коротки,
+    /// а лишние параллельные TLS-сессии только жгут батарею.
+    private val requestPool: ExecutorService = Executors.newFixedThreadPool(2) { r ->
+        Thread(r, "dns-fwd").apply { isDaemon = true }
+    }
+
     /// Проверяет, является ли пакет DNS-запросом (UDP:53).
     /// Возвращает true если пакет перехвачен и обработан.
     fun tryHandle(packet: ByteArray): Boolean {
@@ -57,40 +68,63 @@ class DNSForwarder(
         val payload = packet.copyOfRange(ihl + 8, packet.size)
         if (payload.isEmpty() || dnsServers.isEmpty()) return false
 
-        // ponytail: свой поток на запрос — DNS-запросов из туннеля единицы,
-        // пул не нужен.
-        Thread({
+        // Ограниченный пул вместо потока на пакет. Раньше здесь создавался
+        // поток на каждый перехваченный пакет с обоснованием «запросов
+        // единицы» — но это неверно: браузер, ANY-запрос или шторм от любого
+        // приложения в туннеле дают поток плюс TCP+TLS-сессию на секунды, и
+        // всё это в процессе VPN (OOM/EMFILE = смерть туннеля). Два потока
+        // покрывают реальную нагрузку: DNS-запросы редки и коротки.
+        requestPool.execute {
             val response = resolve(payload)
             if (response != null) {
                 writePacket(wrapResponse(response, packet, ihl))
             } else {
                 EventLog.append(
-                    "dns:fail:dot=${!dotHostname.isNullOrBlank()}:doh=${!dohURL.isNullOrBlank()}:udp=${dnsServers.size}"
+                    "dns:fail:${effectiveModeLabel()}:udp=${dnsServers.size}"
                 )
             }
-        }, "dns-fwd").apply { isDaemon = true }.start()
+        }
         return true
+    }
+
+    /// Что фактически пытались использовать — для журнала. Раньше строка
+    /// журнала писалась из TunnelService и сообщала ВЫБРАННЫЙ транспорт, а не
+    /// сработавший: при сбое DoT она врала.
+    private fun effectiveModeLabel(): String = when {
+        !dotHostname.isNullOrBlank() && !dohURL.isNullOrBlank() -> "dot+doh"
+        !dotHostname.isNullOrBlank() -> "dot"
+        !dohURL.isNullOrBlank() -> "doh"
+        else -> "plain"
     }
 
     /// Порядок попыток.
     ///
-    /// ВАЖНО: plain UDP:53 — НЕ резервный путь для шифрованных транспортов.
-    /// Если пользователь выбрал DoT, упавший DoT-сервер не должен незаметно
-    /// уводить запросы в открытый вид: провайдер снова увидит домены, то есть
-    /// сломается ровно то, ради чего транспорт и выбирался. На iOS системный
-    /// `NEDNSOverTLSSettings` тоже не деградирует в plain :53 — резолв просто
-    /// не работает. Поэтому plain используется ТОЛЬКО когда шифрованного
-    /// транспорта нет вообще (конфиг без DoT/DoH).
+    /// Шифрованный транспорт выбирает пользователь, и форвардер его НЕ
+    /// расширяет: если сработавший транспорт отличается от выбранного, это
+    /// видно в журнале, но молча деградировать в открытый UDP нельзя —
+    /// провайдер снова увидит домены, то есть сломается ровно то, ради чего
+    /// транспорт выбирался. Plain UDP остаётся доступен только конфигам,
+    /// у которых шифрованного транспорта нет вообще.
+    ///
+    /// Второй шифрованный транспорт пробуется как запасной: у пресетов в
+    /// списке есть заведомо нерабочие адреса (см. комментарии к xbox/malw),
+    /// и отказ одного сервера не должен оставлять туннель без резолва вовсе.
     private fun resolve(payload: ByteArray): ByteArray? {
-        val deadline = System.currentTimeMillis() + TOTAL_BUDGET_MS
-        if (dotHostname != null && System.currentTimeMillis() < deadline) {
+        // Бюджет по elapsedRealtime: wall-clock прыгает от NTP и перевода
+        // часов, и дедлайн считался бы неверно (в NetworkMonitor проект
+        // осознанно использует именно elapsedRealtime).
+        val deadline = SystemClock.elapsedRealtime() + TOTAL_BUDGET_MS
+        if (!dotHostname.isNullOrBlank() && SystemClock.elapsedRealtime() < deadline) {
             queryDoT(dotHostname, payload)?.let { return it }
         }
-        if (dohURL != null && System.currentTimeMillis() < deadline) {
+        if (!dohURL.isNullOrBlank() && SystemClock.elapsedRealtime() < deadline) {
             queryDoH(dohURL, payload)?.let { return it }
         }
         // Шифрованный транспорт был, но не ответил — молчим, а не разоблачаемся.
-        if (dotHostname != null || dohURL != null) return null
+        if (!dotHostname.isNullOrBlank() || !dohURL.isNullOrBlank()) {
+            EventLog.append("dns:encrypted_failed:${effectiveModeLabel()}")
+            return null
+        }
         for (server in dnsServers) queryUDP(server, payload)?.let { return it }
         return null
     }
@@ -110,36 +144,46 @@ class DNSForwarder(
         }
         for (server in dnsServers) {
             try {
-                val s = javax.net.ssl.SSLSocketFactory.getDefault()
-                    .createSocket() as SSLSocket
-                s.use { sock ->
-                    val params = sock.sslParameters
-                    // Hostname verification отключена: коннектимся к IP, а имя
-                    // живёт только в SNI — IP не совпадёт с хостом сертификата.
-                    // Целостность даёт TLS, аутентичность — доверие к IP-списку.
-                    params.endpointIdentificationAlgorithm = null
-                    params.serverNames = listOf(SNIHostName(hostname))
-                    sock.sslParameters = params
-                    sock.soTimeout = 3000
-                    sock.connect(InetSocketAddress(InetAddress.getByName(server), 853), 3000)
-                    sock.startHandshake()
+                // Сокет поднимается до IP, а TLS-обёртка — на хост: так SNI и
+                // проверка имени работают, хотя резолва имени нет (адрес берём
+                // из списка). Проверка имени ВКЛЮЧЕНА: без неё любой сертификат,
+                // подписанный доверенным CA, выдавал бы себя за резолвер —
+                // «аутентичность по IP-списку» этого не заменяет, потому что
+                // доверие к IP означает лишь, что мы не ходим по DNS.
+                val plain = java.net.Socket()
+                plain.use { raw ->
+                    raw.soTimeout = 3000
+                    raw.connect(InetSocketAddress(InetAddress.getByName(server), 853), 3000)
+                    val factory = javax.net.ssl.SSLSocketFactory.getDefault() as javax.net.ssl.SSLSocketFactory
+                    val sock = factory.createSocket(raw, hostname, 853, true) as SSLSocket
+                    sock.use { s ->
+                        val params = s.sslParameters
+                        params.endpointIdentificationAlgorithm = "HTTPS"
+                        params.serverNames = listOf(SNIHostName(hostname))
+                        s.sslParameters = params
+                        s.soTimeout = 3000
+                        s.startHandshake()
 
-                    val out = DataOutputStream(sock.outputStream)
-                    out.write(frame)
-                    out.flush()
+                        val out = DataOutputStream(s.outputStream)
+                        out.write(frame)
+                        out.flush()
 
-                    val input = DataInputStream(sock.inputStream)
-                    // Чтение байт-в-байт как было: 2 байта заголовка, затем
-                    // РОВНО len байт тела через readFully. Длину приходится
-                    // разбирать здесь же — иначе не узнать, сколько читать, —
-                    // а сам разбор/проверку делает общая чистая функция.
-                    val header = ByteArray(2)
-                    input.readFully(header)
-                    val len = frameLength(header)
-                    if (len <= 0 || len > MAX_DNS_MESSAGE) return null
-                    val buf = ByteArray(len)
-                    input.readFully(buf)
-                    return parseResponse(header, buf)
+                        val input = DataInputStream(s.inputStream)
+                        // Заголовок читается readFully — он дочитывает сегмент
+                        // за сегментом, поэтому приход длины и тела разными
+                        // TCP-сегментами обрабатывается верно.
+                        val header = ByteArray(2)
+                        input.readFully(header)
+                        val len = frameLength(header)
+                        // Потолок — 16-битное поле длины RFC 7858 (65535), а НЕ
+                        // 4096: 4096 это лимит UDP-датаграммы, к TLS он не
+                        // относится, и длинный ответ (DNSSEC, большой RRset,
+                        // TXT/ANY) молча превращался в «сервер не ответил».
+                        if (len <= 0) return null
+                        val buf = ByteArray(len)
+                        input.readFully(buf)
+                        return buf
+                    }
                 }
             } catch (_: Exception) {
                 // сервер не ответил — пробуем следующий
@@ -204,14 +248,15 @@ class DNSForwarder(
     }
 
     /// Обратная сторона кадра: 2-байтный префикс длины + уже прочитанные байты
-    /// → DNS-сообщение. Границы те же, что были в queryDoT
-    /// (`len <= 0 || len > 4096`), плюс проверка, что тело не короче длины
-    /// (обрыв TCP-потока): иначе ответ уехал бы в туннель обрезанным, а клиент
-    /// принял бы его за настоящий ответ и не переспросил.
+    /// → DNS-сообщение. Потолок — 16-битное поле длины (RFC 7858), а не лимит
+    /// UDP-датаграммы: длинный TLS-ответ это норма (DNSSEC, большие RRset).
+    /// Проверка `body.size < len` остаётся для случая, когда тело пришло
+    /// отдельным вызовом: иначе обрезанный ответ уехал бы в туннель как
+    /// валидный, и клиент не переспросил бы.
     /// internal по той же причине, что и frameQuery.
     internal fun parseResponse(header: ByteArray, body: ByteArray): ByteArray? {
         val len = frameLength(header)
-        if (len <= 0 || len > MAX_DNS_MESSAGE) return null
+        if (len <= 0 || len > MAX_FRAME_PAYLOAD) return null
         if (body.size < len) return null
         return body.copyOf(len)
     }
@@ -249,17 +294,13 @@ class DNSForwarder(
     }
 
     companion object {
-        /// Потолок длины DNS-ответа: длина в кадре DoT — 2 байта, но больше
-        /// 4096 байт UDP-ответ не несёт, и именно эту границу проверял
-        /// queryDoT (`len <= 0 || len > 4096`). Константа одна на весь файл:
+        /// Потолок кадра DoT: ровно 16 бит поля длины (RFC 7858) — и на
+        /// запрос, и на ответ. Раньше здесь стояло 4096 (лимит UDP-датаграммы),
+        /// и это было ошибкой: длинный TLS-ответ (DNSSEC, большой RRset,
+        /// TXT/ANY) не доходил, а выглядело это как «сервер не ответил» —
+        /// без единой строки в журнале. Одна константа на оба направления:
         /// разъехавшись, границы не сломали бы ни одну сборку и убили бы
         /// весь DNS в туннеле — молча.
-        const val MAX_DNS_MESSAGE = 4096
-
-        /// Потолок полезной нагрузки кадра запроса: ровно столько влезает в
-        /// 2-байтный big-endian префикс длины (RFC 7858), и больше этого
-        /// закодировать нечем. Отдельно от MAX_DNS_MESSAGE намеренно: там
-        /// ограничение транспорта (UDP), здесь — только формат кадра.
         const val MAX_FRAME_PAYLOAD = 0xFFFF
 
         /// Общий бюджет времени на одну попытку резолва. Один DoT-сервер

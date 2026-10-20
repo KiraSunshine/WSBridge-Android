@@ -85,8 +85,6 @@ class DNSForwarderTest {
         val dns = dnsQuery()
         val frame = forwarder().frameQuery(dns)
 
-        assertEquals(12 + 1 + 7 + 1 + 3 + 1 + 4, dns.size) // заголовок + имя + QTYPE/QCLASS
-        assertEquals(29, dns.size)
         assertEquals(dns.size + 2, frame.size)
         assertEquals(0x00, frame[0].toInt() and 0xFF) // 29 = 0x001D
         assertEquals(0x1D, frame[1].toInt() and 0xFF)
@@ -133,20 +131,21 @@ class DNSForwarderTest {
         assertArrayEqualsBytes(dns, parsed!!)
     }
 
-    /// Границы длины ответа. 0 — сервер сказал «ничего»; 4097+ — это уже не
-    /// наш лимит (в UDP больше 4096 не приходит), и такой длине доверять
-    /// нельзя: по ней читаются байты из сокета. Обе крайние точки обязаны
-    /// отвергаться, а 1 и 4096 — проходить.
+    /// Границы длины ответа. 0 — сервер сказал «ничего»; выше 16-битного поля
+/// (65535) длину закодировать нечем, и такая граница — признак битого кадра.
+    /// Потолок НЕ 4096: длинный TLS-ответ (DNSSEC, большой RRset, TXT/ANY)
+    /// легитимен, и раньше он молча превращался в «сервер не ответил».
     @Test
     fun `parseResponse rejects lengths outside the sane range`() {
         val fwd = forwarder()
 
         assertNull("len=0", fwd.parseResponse(byteArrayOf(0x00, 0x00), ByteArray(16)))
-        assertNull("len=4097", fwd.parseResponse(byteArrayOf(0x10, 0x01), ByteArray(4097)))
-        assertNull("len=65535", fwd.parseResponse(byteArrayOf(0xFF.toByte(), 0xFF.toByte()), ByteArray(65535)))
+        assertNull("len=65535 без тела", fwd.parseResponse(byteArrayOf(0xFF.toByte(), 0xFF.toByte()), ByteArray(16)))
 
         assertNotNull("len=1", fwd.parseResponse(byteArrayOf(0x00, 0x01), ByteArray(1)))
         assertNotNull("len=4096", fwd.parseResponse(byteArrayOf(0x10, 0x00), ByteArray(4096)))
+        assertNotNull("len=5000", fwd.parseResponse(byteArrayOf(0x13, 0x88.toByte()), ByteArray(5000)))
+        assertNotNull("len=65535", fwd.parseResponse(byteArrayOf(0xFF.toByte(), 0xFF.toByte()), ByteArray(65535)))
     }
 
     /// Обрыв TCP-потока: длина обещает больше, чем пришло. Взять «сколько есть»
