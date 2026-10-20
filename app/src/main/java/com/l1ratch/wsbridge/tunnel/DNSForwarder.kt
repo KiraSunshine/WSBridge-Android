@@ -72,10 +72,25 @@ class DNSForwarder(
         return true
     }
 
-    /// Порядок попыток: DoT → DoH → plain UDP.
+    /// Порядок попыток.
+    ///
+    /// ВАЖНО: plain UDP:53 — НЕ резервный путь для шифрованных транспортов.
+    /// Если пользователь выбрал DoT, упавший DoT-сервер не должен незаметно
+    /// уводить запросы в открытый вид: провайдер снова увидит домены, то есть
+    /// сломается ровно то, ради чего транспорт и выбирался. На iOS системный
+    /// `NEDNSOverTLSSettings` тоже не деградирует в plain :53 — резолв просто
+    /// не работает. Поэтому plain используется ТОЛЬКО когда шифрованного
+    /// транспорта нет вообще (конфиг без DoT/DoH).
     private fun resolve(payload: ByteArray): ByteArray? {
-        if (dotHostname != null) queryDoT(dotHostname, payload)?.let { return it }
-        if (dohURL != null) queryDoH(dohURL, payload)?.let { return it }
+        val deadline = System.currentTimeMillis() + TOTAL_BUDGET_MS
+        if (dotHostname != null && System.currentTimeMillis() < deadline) {
+            queryDoT(dotHostname, payload)?.let { return it }
+        }
+        if (dohURL != null && System.currentTimeMillis() < deadline) {
+            queryDoH(dohURL, payload)?.let { return it }
+        }
+        // Шифрованный транспорт был, но не ответил — молчим, а не разоблачаемся.
+        if (dotHostname != null || dohURL != null) return null
         for (server in dnsServers) queryUDP(server, payload)?.let { return it }
         return null
     }
@@ -246,6 +261,12 @@ class DNSForwarder(
         /// закодировать нечем. Отдельно от MAX_DNS_MESSAGE намеренно: там
         /// ограничение транспорта (UDP), здесь — только формат кадра.
         const val MAX_FRAME_PAYLOAD = 0xFFFF
+
+        /// Общий бюджет времени на одну попытку резолва. Один DoT-сервер
+        /// тратит до 6с (connect + handshake + чтение), а серверов в пресете
+        /// до четырёх — без бюджета клиент, ждущий DNS, копил бы десятки
+        /// секунд. Бюджет режет хвост: не успевшие серверы не пробуем.
+        const val TOTAL_BUDGET_MS = 8000L
 
         fun checksum(b: ByteArray, off: Int, len: Int): Int {
             var sum = 0

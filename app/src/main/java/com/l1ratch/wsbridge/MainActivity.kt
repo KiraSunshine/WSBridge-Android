@@ -111,7 +111,28 @@ class MainActivity : ComponentActivity() {
         // Consent получен (или уже был) — запускаем сервис.
         launchTunnel()
     }
+
+    /// Разрешение на уведомления. Спрашивается ОДИН раз при включении туннеля —
+    /// как requestAuthorization() на iOS. Без него на API 33+ нуджи «сеть
+    /// сменилась» и «туннель включён давно» молча не показываются, а
+    /// NotificationHelper.postNetChange их просто пропускает по проверке.
+    /// Отказ ничего не ломает: туннель работает, диагностика остаётся в журнале.
+    private val askNotifications = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (!granted) Log.i("WSBridge", "notifications denied — nudges disabled, journal unaffected")
+    }
+
+    private fun requestNotificationsOnce() {
+        if (Build.VERSION.SDK_INT < 33) return
+        if (checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) ==
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) return
+        askNotifications.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+    }
+
     private fun launchTunnel() {
+        // Спрашиваем при включении, а не на старте приложения: разрешение
+        // нужно только для нуджей туннеля, и просьба в момент действия понятна.
+        requestNotificationsOnce()
         val intent = Intent(this, TunnelService::class.java).setAction(TunnelService.ACTION_START)
         if (Build.VERSION.SDK_INT >= 26) startForegroundService(intent) else startService(intent)
         // Авто-чек фронтов ПОСЛЕ startService (не до — гонка с записью настроек
