@@ -5,6 +5,14 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <!-- VPN-приложение: systemExempted — единственный FGS-тип для VpnService на API 34+ -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SYSTEM_EXEMPTED" />
+    <!-- NetworkMonitor: registerDefaultNetworkCallback и getNetworkCapabilities без
+         этого разрешения бросают SecurityException. Разрешение нормальное (не
+         dangerous) — запрос у пользователя не нужен. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- Нуджи «сеть сменилась» и «туннель включён давно». На API 33+ без него
+         NotificationManager молча ничего не показывает; сам запрос разрешения
+         делает UI (вне этого файла). -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application
         android:name=".WSBridgeApp"

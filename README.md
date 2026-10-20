@@ -97,16 +97,21 @@ The endpoint list is hot-updatable without rebuilding the app:
 
 ## DNS
 
-DNS from inside the tunnel is forwarded by `DNSForwarder`. Priority:
-**DoH** (DNS-over-HTTPS, RFC 8484 wire format over HTTPS POST) if the
-selected server has a DoH URL configured, falling back to **plain UDP:53**
-otherwise. Without DoH, geo-blocks at the DNS layer cannot be bypassed —
-the provider sees the query on port 53 and can poison the response or
-block it outright.
+DNS from inside the tunnel is intercepted and forwarded by `DNSForwarder`.
+The transport is user-selectable:
 
-Presets (system / Google / Cloudflare / Comss.one / Malw.link) ship with
-DoH URLs; custom plain-IP servers are also supported. Changes take effect
-on the next tunnel start.
+- **DoT** (DNS-over-TLS, RFC 7858) — **default**. TLS directly to the
+  server IP on port 853 with SNI; the hostname is never resolved, so this
+  is the most reliable transport while inside the tunnel.
+- **DoH** (DNS-over-HTTPS, RFC 8484) — HTTPS POST, masquerades as ordinary
+  traffic, but requires the resolver hostname to be resolved first.
+- **plain UDP:53** — fallback for servers that support neither.
+
+Presets: system / Cloudflare / Google / Comss.one / Malw.link / GeoHide /
+XBox DNS / Alt Malw.link, each with a provider site link. Custom servers
+require a DoT hostname: an unencrypted resolver is intercepted by the
+provider, which defeats the point of using a custom one. Changes take
+effect on the next tunnel start.
 
 ## Install
 
@@ -118,10 +123,14 @@ manual uninstall — those were signed with a random key.)
 
 ## Build
 
+Version lives in one place: `wsb.build` in `gradle.properties`. From it
+`versionName` (`0.2.N`) and `versionCode` (`N`) are derived; CI takes the
+maximum of `wsb.build` and the run number so `versionCode` never goes
+backwards and in-place updates keep working.
+
 - Gradle wrapper; CI (GitHub Actions) builds a signed APK on every push
-  to `main` and publishes it to the `preview` prerelease; `versionCode`
-  comes from the CI run number.
-- Local: JDK 17+ (CI uses 21), Android SDK 36, NDK 27+, CMake. The native
+  to `main` and publishes it to the `preview` prerelease.
+- Local: JDK 17+ (CI uses 21), Android SDK 36, NDK 27+ / CMake. The native
   part (lwIP 2.2.0 + JNI bridge, `app/src/main/cpp/`) builds via
   externalNativeBuild.
 
@@ -137,9 +146,17 @@ manual uninstall — those were signed with a random key.)
   TCP goes to the IP);
 - no IPC layer (Darwin notifications, JournalServer): the service and the
   UI share one process, the journal is read directly;
-- the DNS forwarder is live (on iOS the system NEDNSSettings replaced it;
-  there it was dead code); DoH is implemented in-app via OkHttp (RFC 8484)
-  instead of relying on the system private DNS;
+- iOS delegates encrypted DNS to the system (`NEDNSOverTLSSettings` /
+  `NEDNSOverHTTPSSettings`); Android implements both transports in-app —
+  DoT as TLS with SNI plus DNS-over-TCP framing, DoH via OkHttp — because
+  the system private DNS is not available to a `VpnService`. Hostname
+  verification is off for DoT: the socket connects to an IP, so the
+  certificate cannot match it; integrity comes from TLS and authenticity
+  from the trusted IP list;
+- network changes and long-session reminders: iOS watches `NWPathMonitor`
+  in the tunnel extension and posts `UNUserNotificationCenter`
+  notifications; Android uses `ConnectivityManager` callbacks owned by the
+  service, with an in-app alert and a restart action;
 - the DC index is taken from the destination address and `dc_idx` is
   rewritten in the init (the Android client leaves those bytes random
   without a proxy secret; iOS writes them always).

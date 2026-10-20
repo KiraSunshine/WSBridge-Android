@@ -8,22 +8,48 @@ plugins {
 
 android {
     namespace = "com.l1ratch.wsbridge"
-    compileSdk = libs.versions.android.compileSdk.get().toInt()
+    // compileSdk берётся из version catalog; ключ -Pwsb.compileSdk=N позволяет
+    // собрать на другой платформе. Нужен для локальной проверки: на машине
+    // может стоять только один platform (например android-37.0), и без
+    // переопределения юнит-тесты не запускаются вовсе.
+    compileSdk = (project.findProperty("wsb.compileSdk") as String?)?.toIntOrNull()
+        ?: libs.versions.android.compileSdk.get().toInt()
+
+    // ── Версия: единый источник ─────────────────────────────────────
+    // wsb.build из gradle.properties — единственное число для релиза.
+    // В CI номер прогона (BUILD_NUMBER) должен только РАСТИ, чтобы
+    // versionCode не откатился назад и обновление осталось возможным:
+    // берём максимум из wsb.build и BUILD_NUMBER.
+    val wsbBuild = (project.findProperty("wsb.build") as String?)?.toIntOrNull() ?: 1
+    val ciBuild = System.getenv("BUILD_NUMBER")?.toIntOrNull() ?: 0
+    val buildNo = maxOf(wsbBuild, ciBuild)
+    // Нативная сборка выключается ключом -Pwsb.native=false (по умолчанию — вкл).
+    val nativeBuild = (project.findProperty("wsb.native") as String?) != "false"
 
     defaultConfig {
         applicationId = "com.l1ratch.wsbridge"
         minSdk = libs.versions.android.minSdk.get().toInt()
         targetSdk = libs.versions.android.targetSdk.get().toInt()
-        versionCode = System.getenv("BUILD_NUMBER")?.toIntOrNull() ?: 1
-        versionName = "0.2.0"
-        ndk {
-            abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
+        versionCode = buildNo
+        // 0.2.N, где N и есть versionCode — дублировать номер в UI незачем.
+        versionName = "0.2.$buildNo"
+        if (nativeBuild) {
+            ndk {
+                abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
+            }
         }
     }
 
-    externalNativeBuild {
-        cmake {
-            path = file("src/main/cpp/CMakeLists.txt")
+    // Нативная часть (lwIP + JNI) собирается ТОЛЬКО когда есть NDK, и её
+    // можно отключить ключом -Pwsb.native=false. Без NDK Gradle падает уже на
+    // конфигурации проекта, то есть юнит-тесты (они нативной части не касаются)
+    // нельзя было прогнать вообще — а именно они проверяют кадрирование DoT и
+    // сборку DNS-пакетов, где ошибка молчит и ломает весь DNS в туннеле.
+    if (nativeBuild) {
+        externalNativeBuild {
+            cmake {
+                path = file("src/main/cpp/CMakeLists.txt")
+            }
         }
     }
 

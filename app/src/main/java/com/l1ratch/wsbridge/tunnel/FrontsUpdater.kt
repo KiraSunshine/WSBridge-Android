@@ -82,18 +82,61 @@ object FrontsUpdater {
         if (first) persist()
     }
 
-    /// Скачивает апстрим и мерджит в реестр. true = список скачан.
-    /// DNS-проверки — только для новичков и мёртвых: живые не перетестируются.
-    suspend fun update(): Boolean = withContext(Dispatchers.IO) {
-        val text = download() ?: return@withContext false
-        val upstream = text.lines()
-            .map { it.trim().lowercase() }
-            .filter { it.matches(domainRegex) }
-            .distinct()
-        if (upstream.size < MIN_DOMAINS) return@withContext false // битый файл
+    /// Итог обновления списка фронтов.
+    /// Различаем «сеть жива, но файл негодный» и «сеть/источники недоступны»:
+    /// это разные проблемы и чинятся они по-разному. Раньше на оба случая
+    /// писалось одно «не удалось», и тестер не понимал, что происходит.
+    sealed interface Result {
+        /// Список скачан, провалидирован и смерджен в реестр.
+        data object OK : Result
 
+        /// Источник ОТВЕТИЛ, но данные негодные (битый/протухший файл).
+        /// Прежний список не тронут — каскад продолжает работать на нём.
+        data class Stale(val reason: String) : Result
+
+        /// Ни один источник не ответил: нет сети или они недоступны.
+        data object Offline : Result
+    }
+
+    /// Скачивает апстрим и мерджит в реестр.
+    /// Перебираем ИСТОЧНИКИ, а не только URL: битый или протухший файл на
+    /// одном зеркале не должен блокировать попытку на следующем. Иначе
+    /// «протух» с GitHub raw означал бы отказ целиком, хотя jsDelivr мог
+    /// отдать годный список — именно так и терялся рабочий путь.
+    suspend fun update(): Result = withContext(Dispatchers.IO) {
+        // Причина отказа ПРИ ОТВЕТЕ источника: сеть жива, но файл негодный.
+        // Если причина не набралась ни на одном источнике — никто не ответил.
+        var rejection: String? = null
+        for (u in urls) {
+            val raw = try {
+                fetch(u)
+            } catch (_: Exception) {
+                continue // следующий источник
+            } ?: continue
+            val upstream = raw.lines()
+                .map { it.trim().lowercase() }
+                .filter { it.matches(domainRegex) }
+                .distinct()
+            if (upstream.size < MIN_DOMAINS) {
+                rejection = "битый файл (${upstream.size} записей)"
+                continue
+            }
+            val stale = mergeAlive(upstream)
+            if (stale != null) {
+                rejection = stale
+                continue
+            }
+            return@withContext Result.OK
+        }
+        rejection?.let { Result.Stale(it) } ?: Result.Offline
+    }
+
+    /// Вливает живые домены апстрима в реестр и персистит.
+    /// `null` = список принят, иначе причина «негодный файл».
+    /// DNS-проверки идут вне блокировки реестра: резолв медленный, а держать
+    /// на нём `db` — значит останавливать запись успехов/фейлов из каскада.
+    private fun mergeAlive(upstream: List<String>): String? {
         val now = System.currentTimeMillis()
-        // Кого проверять — считаем под блокировкой, сам DNS (медленный) — вне её.
         val unknown = synchronized(db) { upstream.filter { it !in db } }
         val fresh = unknown.filter { resolves(it) }
         val deadInUpstream = synchronized(db) {
@@ -103,9 +146,16 @@ object FrontsUpdater {
         }
         val revived = deadInUpstream.filter { resolves(it) }
 
+        // Уже известное живо, а все новички не резолвятся — файл протух
+        // целиком (NXDOMAIN-волны апстрима). Реестр не трогаем, пробуем
+        // следующее зеркало.
+        if (fresh.isEmpty() && revived.isEmpty() && unknown.isNotEmpty()) {
+            return "протух: живых 0 из ${upstream.size}"
+        }
+
         synchronized(db) {
             // Новички: добавляются только резолвящиеся. Не-резолвящиеся не
-            // добавляются вовсе — их перепроверит следующий апдейт.
+            // попадают в реестр вовсе — их перепроверит следующий апдейт.
             for (d in fresh) if (!db.containsKey(d)) db[d] = Stat(0, 0, now)
             // Ожившие: fails=1 — входит в каскад; если DNS соврал, runtime-кэш
             // и счётчик фейлов быстро выведут его обратно.
@@ -121,7 +171,7 @@ object FrontsUpdater {
         applyAlive()
         prefs.edit().putLong("frontsUpdatedAt", now).apply()
         persist()
-        true
+        return null
     }
 
     /// Успех фронта в каскаде (host вида kws2.pclead.co.uk). Пишет WSClient.
@@ -237,18 +287,7 @@ object FrontsUpdater {
     }
 
     /// Простой HTTP GET с таймаутами: stdlib, без OkHttp-зависимости в UI-слое.
-    private fun download(): String? {
-        for (u in urls) {
-            try {
-                val text = fetch(u)
-                if (text != null) return text
-            } catch (_: Exception) {
-                continue
-            }
-        }
-        return null
-    }
-
+    /// Вызывается по каждому источнику по очереди — перебор в update().
     private fun fetch(url: String): String? {
         val conn = URL(url).openConnection() as HttpURLConnection
         return try {

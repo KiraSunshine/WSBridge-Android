@@ -18,6 +18,7 @@ import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 
 /// Порт PacketTunnelProvider.swift: TUN fd вместо packetFlow, всё остальное —
@@ -39,6 +40,8 @@ class TunnelService : VpnService() {
         const val ACTION_STOP = "stop"
         private const val CHANNEL_ID = "tunnel"
         private const val NOTIF_ID = 1
+        /// Сторож старта: столько секунд даём establish(), как 20с в iOS build 77.
+        private const val START_WATCHDOG_S = 20L
     }
 
     private val lwip = LwipNative
@@ -54,6 +57,14 @@ class TunnelService : VpnService() {
     private var dnsForwarder: DNSForwarder? = null
     @Volatile private var stopped = false
     @Volatile private var starting = false
+
+    // Сторож старта (iOS build 77): establish() — binder-IPC в system_server,
+    // и он может висеть вечно. Оптимистичный updateRunning(true) выше в этом
+    // случае оставлял кнопку «включено» навсегда без единой ошибки в журнале.
+    // Держим и executor, и задачу: отменённую задачу нужно ещё и погасить,
+    // иначе поток останется висеть после снятия сторожа.
+    @Volatile private var startWatchdog: ScheduledFuture<*>? = null
+    private var watchdogExecutor: ScheduledExecutorService? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         // START_NOT_STICKY: после убийства процесса VPN сам не воскрешаем
@@ -83,6 +94,35 @@ class TunnelService : VpnService() {
         // ACTION_STOP, даже если establish ещё висит. Без этого при зависшем
         // старте running оставался false и выключить туннель было нельзя.
         TunnelManager.updateRunning(true)
+        // Сторож взводится ДО фонового старта: если establish() или что-то
+        // после него не дойдёт до конца за 20с — снимаем оптимистичный статус,
+        // чтобы кнопка отражала реальность (iOS build 77: «error shown and
+        // button unlocked»). Плюс отдельная строка в журнале — тестер видит
+        // причину, а не молчаливо «включённый» туннель без трафика.
+        //
+        // ponytail: отдельный одноразовый поток вместо lwipExecutor — сторож
+        // нужен именно тогда, когда рабочий контур ещё не поднялся (executor
+        // создаётся только после успешного establish).
+        val watchdog = Executors.newSingleThreadScheduledExecutor { r ->
+            Thread(r, "wsb-watchdog").apply { isDaemon = true }
+        }
+        watchdogExecutor = watchdog
+        startWatchdog = watchdog.schedule({
+            if (starting) {
+                EventLog.append("start_stall:${START_WATCHDOG_S}s")
+                // Флаг starting СОЗНАТЕЛЬНО не сбрасываем: его сброс открыл бы
+                // повторный ACTION_START и ВТОРОЙ establish() поверх всё ещё
+                // висящего первого — два TUN fd и два контура lwIP.
+                //
+                // ponytail: поэтому залипший навсегда establish() оставляет
+                // сервис неспособным к перезапуску (guard `starting` выше
+                // игнорирует новый START). Лечится выключением VPN в настройках
+                // системы (onRevoke → stopSelf) либо смертью процесса — оба
+                // пути дают чистый инстанс сервиса. Если start_stall появится
+                // в журнале тестера, следующий шаг — stopSelf() в этой ветке.
+                TunnelManager.updateRunning(false)
+            }
+        }, START_WATCHDOG_S, TimeUnit.SECONDS)
         Thread({
             try {
                 startTunnel(workerDomain, dns)
@@ -93,6 +133,8 @@ class TunnelService : VpnService() {
                 TunnelManager.updateRunning(false)
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
+            } finally {
+                disarmWatchdog()
             }
         }, "wsb-start").start()
         return START_NOT_STICKY
@@ -151,15 +193,43 @@ class TunnelService : VpnService() {
         lwipExecutor = Executors.newSingleThreadScheduledExecutor { r ->
             Thread(r, "wsb-lwip").apply { isDaemon = true }
         }
+        // Транспорт выбирает пользователь; фактический может отличаться, если
+        // у конфига нет предпочитаемого (см. effectiveDNSMode). Передаём РОВНО
+        // один шифрованный транспорт — форвардер не додумывает за пользователя.
+        val mode = TunnelManager.effectiveDNSMode
+        val dotHost = if (mode == TunnelManager.DNSMode.DOT) dns.dotHostname else null
+        val dohUrl = if (mode == TunnelManager.DNSMode.DOH) dns.dohURL else null
+        EventLog.append("dns:${dns.id}:${mode?.shortTitle ?: "plain"}:${dns.servers.size}ip")
         dnsForwarder =
-            if (dns.servers.isNotEmpty() || dns.dohURL != null) {
-                DNSForwarder(dns.servers, dns.dohURL) { pkt -> writePacket(pkt) }
+            if (dns.servers.isNotEmpty()) {
+                DNSForwarder(dns.servers, dotHost, dohUrl) { pkt -> writePacket(pkt) }
             } else null
 
         setupLWIP(workerDomain)
         startTimers()
         readLoop()
         starting = false
+        // Старт успел уложиться в 20с — сторож больше не нужен.
+        disarmWatchdog()
+
+        // Нуджи и мониторинг сети (паритет с iOS startTunnel, где next to
+        // startTimers() идут startPathMonitor() и scheduleLongSessionNudge()):
+        // каналы обязаны существовать до первой публикации, монитор ловит
+        // Wi-Fi↔соты, нудж напомнит перезапустить туннель через 6 часов.
+        NotificationHelper.ensureChannels(this)
+        NetworkMonitor.start(this)
+        NotificationHelper.scheduleLongSession(this)
+    }
+
+    /// Гасит сторож старта независимо от исхода: при штатном старте задача не
+    /// должна «выстрелить» позже, при падении — не остаться висеть в очереди.
+    private fun disarmWatchdog() {
+        startWatchdog?.cancel(false)
+        startWatchdog = null
+        // ponytail: shutdown() без awaitTermination — ждать нечего, а
+        // блокировать main-поток ради служебного потока нельзя.
+        watchdogExecutor?.shutdown()
+        watchdogExecutor = null
     }
 
     private fun setupLWIP(workerDomain: String?) {
@@ -293,9 +363,17 @@ class TunnelService : VpnService() {
     private fun stopTunnel() {
         if (stopped && tunIn == null) { stopSelf(); return }
         EventLog.append("tunnel_stop:user:pkts=$packetCount")
+        // Старт мог ещё идти: гасим сторож, иначе он пальнёт start_stall
+        // уже после осознанной остановки, которую сам же пользователь и сделал.
+        disarmWatchdog()
         // Память живости фронтов — на диск до смерти сервиса (процесс может
         // быть убит системой сразу после stopSelf).
         FrontsUpdater.persist()
+        // Нудж 6ч и монитор сети снимаем ЗДЕСЬ (как cancelLongSessionNudge в
+        // iOS stopTunnel, который исполняется всегда): напоминание «туннель
+        // давно включён» не должно дожить до момента, когда туннель выключен.
+        NetworkMonitor.stop()
+        NotificationHelper.cancelLongSession(this)
         TunnelManager.updateRunning(false)
         stopped = true
         lwipExecutor?.let { ex ->
@@ -325,7 +403,14 @@ class TunnelService : VpnService() {
     override fun onRevoke() {
         // Система отзывает VPN (пользователь выключил в настройках / другой VPN).
         EventLog.append("tunnel_stop:revoked:pkts=$packetCount")
+        disarmWatchdog()
         FrontsUpdater.persist()
+        // Оба пути остановки обязаны снимать нудж и монитор: onRevoke приходит
+        // из system_server и НЕ проходит через stopTunnel, так что без этих
+        // строк туннель, отозванный из настроек, оставлял бы живой монитор и
+        // напоминание «туннель давно включён» при выключенном туннеле.
+        NetworkMonitor.stop()
+        NotificationHelper.cancelLongSession(this)
         TunnelManager.updateRunning(false)
         stopped = true
         runCatching { lwipExecutor?.shutdownNow() }
@@ -336,6 +421,12 @@ class TunnelService : VpnService() {
 
     override fun onDestroy() {
         stopped = true
+        disarmWatchdog()
+        // Страховка на пути, которые до сюда не дошли (start_fail:*,
+        // establish_null, tun_dead): сервис умирает всегда, а монитор сети и
+        // нудж 6ч не должны пережить его. Оба вызова идемпотентны.
+        NetworkMonitor.stop()
+        NotificationHelper.cancelLongSession(this)
         TunnelManager.updateRunning(false)
         runCatching { lwipExecutor?.shutdownNow() }
         closeTun()

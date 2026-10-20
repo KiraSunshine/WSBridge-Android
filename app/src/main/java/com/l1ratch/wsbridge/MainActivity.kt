@@ -1,9 +1,12 @@
 package com.l1ratch.wsbridge
 
+import android.content.Context
 import android.content.Intent
 import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
+import android.net.Uri
+import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -41,6 +44,7 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.FilledIconButton
 import androidx.compose.material3.Icon
@@ -79,6 +83,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.l1ratch.wsbridge.tunnel.CFDomains
 import com.l1ratch.wsbridge.tunnel.FrontsUpdater
+import com.l1ratch.wsbridge.tunnel.NetworkMonitor
 import com.l1ratch.wsbridge.tunnel.TunnelService
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -86,6 +91,18 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+
+/// Открывает ссылку во внешнем браузере. Хелпер на Context, а не на
+/// Activity: вызывается из Compose-экрана, где Activity под рукой нет.
+/// startActivity может бросить (нет браузера/некорректный URL) — гасим:
+/// падение из-за ссылки в меню недопустимо.
+fun Context.openUrl(url: String) {
+    try {
+        startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+    } catch (t: Throwable) {
+        Log.w("WSBridge", "openUrl failed: $url: ${t.message}")
+    }
+}
 
 /// Главный экран: молния-кнопка (порт ContentView.swift) + меню.
 class MainActivity : ComponentActivity() {
@@ -99,10 +116,14 @@ class MainActivity : ComponentActivity() {
         if (Build.VERSION.SDK_INT >= 26) startForegroundService(intent) else startService(intent)
         // Авто-чек фронтов ПОСЛЕ startService (не до — гонка с записью настроек
         // во время старта). Rate-limit 30 мин; применяется при следующем
-        // включении, не в текущей сессии.
+        // включении, не в текущей сессии. Итог в фоне — молча: это не действие
+        // пользователя, отвлекать его снэкбаром нечем.
         if (FrontsUpdater.shouldAutoUpdate()) {
             scope.launch {
-                FrontsUpdater.update()
+                val r = FrontsUpdater.update()
+                if (r is FrontsUpdater.Result.Stale) {
+                    Log.w("WSBridge", "auto fronts update: stale (${r.reason})")
+                }
             }
         }
     }
@@ -113,11 +134,28 @@ class MainActivity : ComponentActivity() {
         startService(Intent(this, TunnelService::class.java).setAction(TunnelService.ACTION_STOP))
     }
 
+    /// Перезапуск туннеля: выкл → дождаться остановки → вкл.
+    /// Порт restartTunnel() из iOS. Ждём именно `running == false`: сервис и
+    /// UI в одном процессе, флаг сбрасывается самим сервисом при остановке,
+    /// так что это честное ожидание, а не фиксированная пауза. Если сервис
+    /// не отписался за 10 с — всё равно запускаем: ACTION_START в живом
+    /// сервисе идемпотентен (guard `starting || tunIn != null`).
+    private fun restartTunnel() {
+        scope.launch {
+            stopTunnel()
+            for (i in 0 until 40) {
+                if (!TunnelManager.running) break
+                delay(250)
+            }
+            launchTunnel()
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         TunnelManager.init(this)
         FrontsUpdater.init(this)
-        setContent { App(onToggle = ::toggle) }
+        setContent { App(onToggle = ::toggle, onRestart = ::restartTunnel) }
     }
 
     override fun onDestroy() {
@@ -137,6 +175,8 @@ class MainActivity : ComponentActivity() {
 }
 
 private val Green = Color(0xFF17A05E)
+/// Предупреждающий акцент: неполная конфигурация, фолбэк транспорта.
+private val Orange = Color(0xFFE08A2E)
 private val Indigo = Color(0xFF1E3A6E)
 private val BottomDark = Color(0xFF040810)
 private val DarkBg = Color(0xFF0D1526)
@@ -146,13 +186,13 @@ private val DarkBg = Color(0xFF0D1526)
 private fun px(dp: Dp): Float = with(LocalDensity.current) { dp.toPx() }
 
 @Composable
-fun App(onToggle: () -> Unit) {
+fun App(onToggle: () -> Unit, onRestart: () -> Unit) {
     // Только тёмная тема (как на iOS): светлую отключили — автоадаптация
     // давала блёклые экраны, а градиенты под светлую ломали контраст.
     MaterialTheme(colorScheme = darkColorScheme(background = DarkBg, surface = DarkBg)) {
         var screen by remember { mutableStateOf<Any>("main") }
         when (screen) {
-            "main" -> MainScreen(onToggle = onToggle, navigate = { screen = it })
+            "main" -> MainScreen(onToggle = onToggle, onRestart = onRestart, navigate = { screen = it })
             "dnsManage" -> DnsManageScreen(navigate = { screen = it })
             "worker" -> WorkerScreen(navigate = { screen = it })
             "journal" -> JournalScreen(navigate = { screen = it })
@@ -163,23 +203,30 @@ fun App(onToggle: () -> Unit) {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun MainScreen(onToggle: () -> Unit, navigate: (String) -> Unit) {
+private fun MainScreen(onToggle: () -> Unit, onRestart: () -> Unit, navigate: (String) -> Unit) {
     val running = TunnelManager.running
+    val ctx = LocalContext.current
     var showMenu by remember { mutableStateOf(false) }
     var showDns by remember { mutableStateOf(false) }
-    // Ручное обновление фронтов: null = не идёт, "run" = качает, "ok:N"/"err" = итог.
+    // Ручное обновление фронтов: null = не идёт, "run" = качает, "ok:N"/"err" = итог,
+    // "stale:…" = источник ответил, но список негодный (сеть при этом жива).
     var frontsStatus by remember { mutableStateOf<String?>(null) }
 
     // Клик меню ставит "run" → этот эффект один раз скачивает и пишет итог.
     LaunchedEffect(frontsStatus) {
         when (frontsStatus) {
             "run" -> {
-                val ok = FrontsUpdater.update()
-                frontsStatus = if (ok) "ok:${CFDomains.size}" else "err"
+                val result = FrontsUpdater.update()
+                frontsStatus = when (result) {
+                    FrontsUpdater.Result.OK -> "ok:${CFDomains.size}"
+                    // Честная диагностика: при живой сети негодный файл и
+                    // «нет сети» — разные проблемы, и чинятся по-разному.
+                    is FrontsUpdater.Result.Stale -> "stale:${result.reason}"
+                    FrontsUpdater.Result.Offline -> "offline"
+                }
             }
-            "err" -> { delay(3500); frontsStatus = null }
-            else -> if (frontsStatus?.startsWith("ok") == true) {
-                delay(3500); frontsStatus = null
+            else -> if (frontsStatus != null) {
+                delay(5000); frontsStatus = null
             }
         }
     }
@@ -276,6 +323,23 @@ private fun MainScreen(onToggle: () -> Unit, navigate: (String) -> Unit) {
                                     leadingIcon = { Icon(Icons.Default.Info, null) },
                                     onClick = { showMenu = false; navigate("about") },
                                 )
+                                HorizontalDivider()
+                                // Ссылки на репозитории (как в iOS-меню): свой
+                                // исходник и апстрим портируемой логики.
+                                DropdownMenuItem(
+                                    text = { Text("Исходный код") },
+                                    onClick = {
+                                        showMenu = false
+                                        ctx.openUrl("https://github.com/l1ratch/WSBridge-Android")
+                                    },
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Исходная логика") },
+                                    onClick = {
+                                        showMenu = false
+                                        ctx.openUrl("https://github.com/Flowseal/tg-ws-proxy")
+                                    },
+                                )
                             }
                         }
                     },
@@ -294,9 +358,11 @@ private fun MainScreen(onToggle: () -> Unit, navigate: (String) -> Unit) {
                     DnsPill { showDns = true }
                 }
 
-                // Версия — по нижнему краю, как на iOS.
+                // Версия — по нижнему краю, как на iOS. Только маркетинговая
+                // версия (0.2.N): её последнее число и есть номер сборки,
+                // дублировать его в скобках незачем.
                 Text(
-                    "v${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE}) · © 2026 l1ratch",
+                    "v${BuildConfig.VERSION_NAME} · © 2026 l1ratch",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f),
                     modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 16.dp),
@@ -309,13 +375,47 @@ private fun MainScreen(onToggle: () -> Unit, navigate: (String) -> Unit) {
 
     // Статус обновления фронтов: поверх всего, автоскрытие — в LaunchedEffect.
     frontsStatus?.let { st ->
+        // Тексты честные: при живой сети негодный файл и «нет сети» — разные
+        // проблемы. Раньше на оба случая было одно «не удалось (сеть?)»,
+        // и по журналу нельзя было понять, что чинить.
         val msg = when {
             st == "run" -> "Обновление списка фронтов…"
-            st == "err" -> "Не удалось обновить (сеть?). Встроенный список активен."
+            st == "offline" -> "Источники недоступны (нет сети?). Работает прежний список."
+            st.startsWith("stale:") -> "Источник ответил, но список негодный: " +
+                st.removePrefix("stale:") + ". Оставил прежний."
             st.startsWith("ok") -> "Фронты обновлены: ${st.removePrefix("ok:")} доменов"
             else -> st
         }
-        Snackbar { Text(msg) }
+        Snackbar(modifier = if (st != "run" && !st.startsWith("ok")) Modifier.padding(8.dp) else Modifier) {
+            Text(msg)
+        }
+    }
+
+    // Смена сети, пока туннель работал (порт in-app алерта iOS build 83).
+    // Туннель остался на старой сети: WS-сессии и состояние lwIP порваны,
+    // трафик «протухает» до ручного перезапуска. Показываем честно и даём
+    // действие — перезапуск одной кнопкой.
+    if (NetworkMonitor.alertAt != 0L) {
+        AlertDialog(
+            onDismissRequest = { NetworkMonitor.clearAlert() },
+            title = { Text("Сеть сменилась") },
+            text = {
+                Text(
+                    if (NetworkMonitor.lastChangeDesc.isNotEmpty())
+                        "${NetworkMonitor.lastChangeDesc}. Если интернет тормозит — перезапусти туннель."
+                    else "Если интернет тормозит — перезапусти туннель."
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    NetworkMonitor.clearAlert()
+                    onRestart()
+                }) { Text("Перезапустить туннель") }
+            },
+            dismissButton = {
+                TextButton(onClick = { NetworkMonitor.clearAlert() }) { Text("Позже") }
+            },
+        )
     }
 }
 
@@ -401,7 +501,9 @@ private fun DnsSheet(onDismiss: () -> Unit, navigate: (String) -> Unit) {
                         Column(Modifier.weight(1f)) {
                             Text(config.name)
                             Text(
-                                config.description,
+                                // Та же подпись, что и в управлении DNS:
+                                // описание + какие транспорты есть у конфига.
+                                "${config.description} · ${config.transportsLabel}",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
                             )
@@ -446,6 +548,38 @@ private fun DnsManageScreen(navigate: (String) -> Unit) {
                 .verticalScroll(rememberScrollState())
                 .padding(16.dp)
         ) {
+            // Свитчер транспорта: DoT по умолчанию (прямой коннект к IP:853,
+            // без бутстрап-резолва имени под туннелем), DoH — если нужна
+            // маскировка под HTTPS.
+            Text("Шифрование DNS", style = MaterialTheme.typography.titleMedium)
+            var modeRaw by remember { mutableStateOf(TunnelManager.dnsModeRaw) }
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                for (m in TunnelManager.DNSMode.entries) {
+                    FilterChip(
+                        selected = modeRaw == m.raw,
+                        onClick = { modeRaw = m.raw; TunnelManager.dnsModeRaw = m.raw },
+                        label = { Text(m.shortTitle) },
+                    )
+                }
+            }
+            Text(
+                TunnelManager.DNSMode.of(modeRaw).hint,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
+            )
+            // У выбранного сервера может не быть предпочитаемого транспорта —
+            // честно говорим, что пойдёт запасной, а не делаем вид, что всё по свитчеру.
+            val sel = TunnelManager.selectedDNS
+            if (sel.servers.isNotEmpty() && TunnelManager.effectiveDNSMode != TunnelManager.dnsMode) {
+                val eff = TunnelManager.effectiveDNSMode
+                Text(
+                    if (eff == null) "У этого сервера нет ни DoT, ни DoH — запросы пойдут простым DNS (порт 53)."
+                    else "У этого сервера нет ${TunnelManager.dnsMode.shortTitle} — будет использован ${eff.shortTitle}.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Orange,
+                )
+            }
+            Spacer(Modifier.height(16.dp))
             Text("Пресеты", style = MaterialTheme.typography.titleMedium)
             for (config in TunnelManager.dnsPresets) {
                 DnsRow(config, onClick = null)
@@ -464,7 +598,9 @@ private fun DnsManageScreen(navigate: (String) -> Unit) {
                     Text("Удалить ${config.name}", color = MaterialTheme.colorScheme.error)
                 }
             }
-            OutlinedButton(onClick = { editing = TunnelManager.DNSConfig("", "", "", emptyList(), null, false) }) {
+            OutlinedButton(onClick = {
+                editing = TunnelManager.DNSConfig("", "", "", emptyList(), null, null, null, false)
+            }) {
                 Text("Добавить DNS")
             }
         }
@@ -474,10 +610,11 @@ private fun DnsManageScreen(navigate: (String) -> Unit) {
         DnsEditorDialog(
             initial = config.takeIf { it.id.isNotEmpty() },
             onDismiss = { editing = null },
-            onSave = { name, desc, servers, dohURL ->
+            onSave = { name, desc, servers, dotHost, dohURL ->
                 val entry = TunnelManager.DNSConfig(
                     id = if (config.id.isNotEmpty()) config.id else java.util.UUID.randomUUID().toString(),
-                    name = name, description = desc, servers = servers, dohURL = dohURL, isPreset = false,
+                    name = name, description = desc, servers = servers,
+                    dohURL = dohURL, dotHostname = dotHost, isPreset = false,
                 )
                 custom = if (config.id.isNotEmpty()) custom.map { if (it.id == entry.id) entry else it }
                 else custom + entry
@@ -491,6 +628,7 @@ private fun DnsManageScreen(navigate: (String) -> Unit) {
 
 @Composable
 private fun DnsRow(config: TunnelManager.DNSConfig, onClick: (() -> Unit)?) {
+    val ctx = LocalContext.current
     Row(
         Modifier
             .fillMaxWidth()
@@ -500,16 +638,28 @@ private fun DnsRow(config: TunnelManager.DNSConfig, onClick: (() -> Unit)?) {
     ) {
         Column(Modifier.weight(1f)) {
             Text(config.name)
-            val detail = buildString {
-                if (config.dohURL != null) append("DoH · ")
-                if (config.servers.isNotEmpty()) append(config.servers.joinToString(", "))
-                else append(config.description)
-            }
+            // Подпись = описание + метка транспортов (какие есть у конфига).
             Text(
-                detail,
+                "${config.description} · ${config.transportsLabel}",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
             )
+            if (config.servers.isNotEmpty()) {
+                Text(
+                    config.servers.joinToString(", "),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.45f),
+                )
+            }
+            // Офсайт провайдера: у пресетов он есть, у своих — нет.
+            config.site?.let { site ->
+                Text(
+                    "Сайт провайдера",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Green,
+                    modifier = Modifier.clickable { ctx.openUrl(site) },
+                )
+            }
         }
         if (TunnelManager.selectedDNSId == config.id) {
             Icon(Icons.Default.CheckCircle, null, tint = Green)
@@ -524,11 +674,12 @@ private fun DnsRow(config: TunnelManager.DNSConfig, onClick: (() -> Unit)?) {
 private fun DnsEditorDialog(
     initial: TunnelManager.DNSConfig?,
     onDismiss: () -> Unit,
-    onSave: (name: String, description: String, servers: List<String>, dohURL: String?) -> Unit,
+    onSave: (name: String, description: String, servers: List<String>, dotHostname: String?, dohURL: String?) -> Unit,
 ) {
     var name by remember { mutableStateOf(initial?.name ?: "") }
     var description by remember { mutableStateOf(initial?.description ?: "") }
     var servers by remember { mutableStateOf(initial?.servers?.toMutableList() ?: mutableListOf("")) }
+    var dotHostname by remember { mutableStateOf(initial?.dotHostname ?: "") }
     var dohURL by remember { mutableStateOf(initial?.dohURL ?: "") }
 
     AlertDialog(
@@ -537,9 +688,16 @@ private fun DnsEditorDialog(
             TextButton(
                 onClick = {
                     val cleanDoh = dohURL.trim().takeIf { it.isNotEmpty() }
-                    onSave(name.trim(), description.trim(), servers.map { it.trim() }.filter { it.isNotEmpty() }, cleanDoh)
+                    val cleanDot = dotHostname.trim().takeIf { it.isNotEmpty() }
+                    onSave(
+                        name.trim(), description.trim(),
+                        servers.map { it.trim() }.filter { it.isNotEmpty() },
+                        cleanDot, cleanDoh,
+                    )
                 },
-                enabled = name.isNotBlank() && (servers.any { it.isNotBlank() } || dohURL.isNotBlank()),
+                // DoT обязателен: свой DNS без TLS не принимается — незашифрованный
+                // резолв перехватывается провайдером, т.е. теряется смысл сервера.
+                enabled = name.isNotBlank() && servers.any { it.isNotBlank() } && dotHostname.isNotBlank(),
             ) { Text("Сохранить") }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Отмена") } },
@@ -547,22 +705,20 @@ private fun DnsEditorDialog(
         text = {
             Column(Modifier.verticalScroll(rememberScrollState())) {
                 OutlinedTextField(name, { name = it }, label = { Text("Название") }, singleLine = true)
-                OutlinedTextField(description, { description = it }, label = { Text("Описание") }, singleLine = true)
-                Spacer(Modifier.height(8.dp))
-                Text("DoH URL (приоритет)", style = MaterialTheme.typography.labelLarge)
                 OutlinedTextField(
-                    dohURL,
-                    { dohURL = it },
-                    label = { Text("https://dns.example.com/dns-query") },
+                    description,
+                    { if (it.length <= TunnelManager.DESCRIPTION_LIMIT) description = it },
+                    label = { Text("Описание (необязательно)") },
                     singleLine = true,
                 )
                 Text(
-                    "DNS-over-HTTPS: запрос шифруется внутри TLS, провайдер не видит домен. Приоритет над plain UDP.",
+                    "${description.length}/${TunnelManager.DESCRIPTION_LIMIT}",
                     style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
+                    color = if (description.length >= TunnelManager.DESCRIPTION_LIMIT) Orange
+                    else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f),
                 )
                 Spacer(Modifier.height(8.dp))
-                Text("Серверы (IP, fallback)", style = MaterialTheme.typography.labelLarge)
+                Text("Серверы (IP)", style = MaterialTheme.typography.labelLarge)
                 servers.forEachIndexed { i, server ->
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         OutlinedTextField(
@@ -585,11 +741,40 @@ private fun DnsEditorDialog(
                     }
                 }
                 TextButton(onClick = { servers = (servers + "").toMutableList() }) { Text("Добавить сервер") }
+                Spacer(Modifier.height(8.dp))
+                Text("DNS-over-TLS (обязательно)", style = MaterialTheme.typography.labelLarge)
+                OutlinedTextField(
+                    dotHostname,
+                    { dotHostname = it },
+                    label = { Text("dns.example.com") },
+                    singleLine = true,
+                )
                 Text(
-                    "Plain UDP:53 — fallback если DoH недоступен. Без DoH гео-блокировки по DNS не обходятся.",
+                    "Имя хоста сервера для SNI. Коннект идёт напрямую к IP:853 — резолв имени под туннелем не нужен, поэтому DoT самый надёжный вариант.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
                 )
+                Spacer(Modifier.height(8.dp))
+                Text("DNS-over-HTTPS (по желанию)", style = MaterialTheme.typography.labelLarge)
+                OutlinedTextField(
+                    dohURL,
+                    { dohURL = it },
+                    label = { Text("https://example.com/dns-query") },
+                    singleLine = true,
+                )
+                Text(
+                    "Нужен, только если хотите работать через DoH: порт 443, маскировка под обычный HTTPS.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
+                )
+                if (dotHostname.isBlank()) {
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        "Укажите DoT-хост: свой DNS без TLS не принимается — незашифрованный резолв перехватывается провайдером.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Orange,
+                    )
+                }
             }
         },
     )
@@ -734,7 +919,8 @@ private fun AboutScreen(navigate: (String) -> Unit) {
             Spacer(Modifier.height(8.dp))
             Text("WSBridge", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
             Text(
-                "${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})",
+                // 0.2.N — единый формат везде: N и есть versionCode.
+                BuildConfig.VERSION_NAME,
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
             )
@@ -750,13 +936,13 @@ private fun AboutScreen(navigate: (String) -> Unit) {
             Spacer(Modifier.height(8.dp))
             LinkRow("Автор: l1ratch", null)
             LinkRow("Исходный код WSBridge-Android") {
-                openUrl(context, "https://github.com/l1ratch/WSBridge-Android")
+                context.openUrl("https://github.com/l1ratch/WSBridge-Android")
             }
             LinkRow("Оригинал: tg-ws-proxy (Flowseal)") {
-                openUrl(context, "https://github.com/Flowseal/tg-ws-proxy")
+                context.openUrl("https://github.com/Flowseal/tg-ws-proxy")
             }
             LinkRow("Версия для iOS") {
-                openUrl(context, "https://github.com/l1ratch/WSBridge-iOS")
+                context.openUrl("https://github.com/l1ratch/WSBridge-iOS")
             }
         }
     }
@@ -772,10 +958,4 @@ private fun LinkRow(title: String, onClick: (() -> Unit)?) {
             .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)
             .padding(vertical = 6.dp),
     )
-}
-
-private fun openUrl(context: android.content.Context, url: String) {
-    runCatching {
-        context.startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse(url)))
-    }
 }
