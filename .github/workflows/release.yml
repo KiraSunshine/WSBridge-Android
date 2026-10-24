@@ -1,9 +1,11 @@
 name: Release (Tag v*)
 
-# Релизный сборщик. Запускается ТОЛЬКО пушем тега v0.2.0 и т.п.
+# Релизный сборщик. Запускается ТОЛЬКО пушем тега v0.3.0 и т.п.
 # Создаёт GitHub Release с подписанным APK.
-# Версия: versionCode и versionName берутся из одного числа — wsb.build в
-# gradle.properties; тег обязан совпадать с ним, иначе job падает до сборки.
+# Версия — ДВА числа из gradle.properties: wsb.build (монотонный номер
+# сборки → versionCode) и wsb.version (маркетинговая semver → versionName
+# и тег релиза). Тег обязан совпадать с wsb.version, а versionCode — не
+# откатываться ниже опубликованного preview, иначе job падает до сборки.
 # Подпись: RELEASE_KEYSTORE_B64 + RELEASE_KEYSTORE_PASSWORD + RELEASE_KEY_ALIAS
 # + RELEASE_KEY_PASSWORD в секретах; без них — debug-ключ (ставится, но не для
 # обновления поверх старых релизных сборок).
@@ -23,15 +25,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ── Версия: единственный источник — wsb.build ──────────────────────
-      # app/build.gradle.kts считает buildNo = max(wsb.build, BUILD_NUMBER),
-      # versionCode = buildNo, versionName = "0.2.$buildNo". Значит номер
-      # релиза равен wsb.build — и ровно это же число задаётся как
-      # BUILD_NUMBER ниже, чтобы релиз и preview жили в одной нумерации.
-      # Раньше релиз не задавал BUILD_NUMBER вовсе, а preview брал
-      # github.run_number: номер прогона растёт сам по себе, обгонял
-      # wsb.build, и установка релиза поверх такого preview отбивалась
-      # Android («App not installed»).
+      # ── Версия: ДВА числа, источник — gradle.properties ──────────────
+      # wsb.build → versionCode (max с BUILD_NUMBER в Gradle; CI передаёт
+      # BUILD_NUMBER = wsb.build, так что совпадает точно). wsb.version →
+      # versionName. Значит тег релиза описывает versionName, а монотонность
+      # versionCode держится на wsb.build.
       - name: Read version
         id: ver
         run: |
@@ -40,51 +38,55 @@ jobs:
           case "$BUILD" in
             ''|*[!0-9]*) echo "::error::wsb.build не найден или не число в gradle.properties"; exit 1 ;;
           esac
+          VERSION=$(grep -E '^[[:space:]]*wsb\.version[[:space:]]*=' gradle.properties | tail -n 1 | cut -d= -f2 | tr -d '[:space:]' || true)
+          case "$VERSION" in
+            ''|*[!0-9A-Za-z.\-+]*) echo "::error::wsb.version не найден в gradle.properties"; exit 1 ;;
+          esac
           echo "build=$BUILD" >> "$GITHUB_OUTPUT"
-          echo "version=0.2.$BUILD" >> "$GITHUB_OUTPUT"
-          echo "wsb.build=$BUILD → versionName 0.2.$BUILD, versionCode $BUILD"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "wsb.build=$BUILD → versionCode $BUILD; wsb.version=$VERSION → versionName"
 
-      # Тег обязан описывать ту же версию, что и файл: номер берётся ИЗ
-      # gradle.properties, а не из тега, поэтому тег v0.2.N при wsb.build=M
-      # собрал бы APK, который в UI показывает 0.2.M (MainActivity читает
-      # BuildConfig.VERSION_NAME). Падаем до сборки, а не после публикации.
-      # Принимаем обе формы: v0.2.N (то, что даёт триггер 'v*') и 0.2.N.
-      - name: Check tag matches wsb.build
+      # Тег обязан совпадать с МАРКЕТИНГОВОЙ версией из файла (порт iOS
+      # build 109: «Check tag matches WSB_VERSION»). Версия берётся ИЗ
+      # gradle.properties, а не из тега, поэтому тег v0.3.0 при
+      # wsb.version=0.3.1 собрал бы APK, который в UI показывает 0.3.1
+      # (MainActivity читает BuildConfig.VERSION_NAME). Падаем до сборки,
+      # а не после публикации. Принимаем обе формы: v0.3.0 (даёт триггер
+      # 'v*') и 0.3.0.
+      - name: Check tag matches wsb.version
         env:
           TAG_REF: ${{ github.ref_name }}
           EXPECTED: ${{ steps.ver.outputs.version }}
-          BUILD: ${{ steps.ver.outputs.build }}
         run: |
           set -euo pipefail
           TAG="${TAG_REF#v}"
           if [ "$TAG" != "$EXPECTED" ]; then
-            echo "::error::Тег $TAG_REF не совпадает с wsb.build=$BUILD (ожидается тег v$EXPECTED)."
+            echo "::error::Тег $TAG_REF не совпадает с wsb.version=$EXPECTED (ожидается тег v$EXPECTED)."
             echo "Если верен файл — перенесите тег на текущий коммит:"
             echo "  git tag -f v$EXPECTED && git push -f origin v$EXPECTED"
-            case "${TAG##*.}" in
-              ''|*[!0-9]*) echo "Если верен тег — приведите wsb.build к номеру этого тега и перезапустите сборку." ;;
-              *) echo "Если верен тег — поднимите wsb.build до ${TAG##*.} и переназначьте тег на коммит с этим изменением." ;;
-            esac
+            echo "Если верен тег — исправьте wsb.version=$TAG в gradle.properties, закоммитьте и переназначьте тег на этот коммит."
             exit 1
           fi
-          echo "OK: тег $TAG_REF = versionName $EXPECTED (versionCode $BUILD)"
+          echo "OK: тег $TAG_REF = wsb.version $EXPECTED"
 
-      # versionCode не должен откатываться назад относительно уже
-      # опубликованных релизов: Android отказывает в установке APK с меньшим
-      # номером. Тег текущего прогона на remote уже существует, но он даёт
-      # равенство с wsb.build, поэтому сравнение строго на «меньше».
+      # versionCode не должен откатываться назад: Android отказывает в
+      # установке APK с меньшим номером. Релиз и preview живут в ОДНОЙ
+      # нумерации (оба берут wsb.build), поэтому источник для сравнения —
+      # последняя опубликованная preview: build-маркер в её описании
+      # («build N», пишет build.yml). Маркера нет (первый релиз после
+      # смены схемы) — проверка пропускается.
       - name: Check versionCode is not a downgrade
         env:
           BUILD: ${{ steps.ver.outputs.build }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          TAGS=$(git ls-remote --tags --refs origin 'v0.2.*')
-          PREV=$(printf '%s\n' "$TAGS" | sed -E 's#.*refs/tags/v0\.2\.##' | grep -E '^[0-9]+$' | sort -n | tail -n 1 || true)
+          PREV=$(gh release view preview --json body --jq .body 2>/dev/null | grep -oE 'build [0-9]+' | grep -oE '[0-9]+' | tail -n 1 || true)
           if [ -n "$PREV" ] && [ "$BUILD" -lt "$PREV" ]; then
-            echo "::error::wsb.build=$BUILD меньше уже опубликованного релиза $PREV — обновление поверх будет отбито Android. Поднимите wsb.build минимум до $PREV."
+            echo "::error::wsb.build=$BUILD меньше опубликованной preview (build $PREV) — обновление поверх будет отбито Android. Поднимите wsb.build минимум до $PREV."
             exit 1
           fi
-          echo "OK: versionCode $BUILD (максимум опубликованного релиза: ${PREV:-нет})"
+          echo "OK: versionCode $BUILD (preview: ${PREV:-нет маркера})"
 
       - name: Set up JDK 21
         uses: actions/setup-java@v5

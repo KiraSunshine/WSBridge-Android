@@ -30,6 +30,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.BarChart
 import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Cloud
@@ -151,7 +152,18 @@ class MainActivity : ComponentActivity() {
 
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
 
+    // Тумблер (порт iOS build 94/95):
+    // - дебаунс 1.2с: дабл-тапы не должны рождать стоп-старт-стоп гонку;
+    // - dup-stop guard: тап сразу после «выкл» — это дабл-тап по той же
+    //   кнопке, а не намерение включить. Без него быстрое второе касание
+    //   превращалось в старт умирающего туннеля.
+    // elapsedRealtime, а не wall-clock: переводы часов и NTP не должны
+    // ломать тайминги (как в NetworkMonitor).
+    private var lastToggleAt = 0L
+    private var lastStopSentAt = 0L
+
     private fun stopTunnel() {
+        lastStopSentAt = android.os.SystemClock.elapsedRealtime()
         startService(Intent(this, TunnelService::class.java).setAction(TunnelService.ACTION_STOP))
     }
 
@@ -185,10 +197,18 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun toggle() {
+        val now = android.os.SystemClock.elapsedRealtime()
+        // Дебаунс 1.2с (iOS build 94): дабл-тап игнорируется целиком.
+        if (now - lastToggleAt < 1200) return
+        lastToggleAt = now
         if (TunnelManager.running) {
             stopTunnel()
             return
         }
+        // Dup-stop guard (iOS build 95): running уже false, но стоп мог
+        // уйти только что — тап в первые 0.8с это дабл-тап по «выкл»,
+        // а не «вкл». Дальше — честное намерение включить.
+        if (now - lastStopSentAt < 800) return
         // VpnService.prepare: null = согласие уже есть, иначе системный диалог.
         val consent = VpnService.prepare(this)
         if (consent == null) launchTunnel() else startTunnel.launch(consent)
@@ -217,6 +237,7 @@ fun App(onToggle: () -> Unit, onRestart: () -> Unit) {
             "dnsManage" -> DnsManageScreen(navigate = { screen = it })
             "worker" -> WorkerScreen(navigate = { screen = it })
             "journal" -> JournalScreen(navigate = { screen = it })
+            "stats" -> StatsScreen(navigate = { screen = it })
             "about" -> AboutScreen(navigate = { screen = it })
         }
     }
@@ -320,6 +341,11 @@ private fun MainScreen(onToggle: () -> Unit, onRestart: () -> Unit, navigate: (S
                                     text = { Text("Журнал туннеля") },
                                     leadingIcon = { Icon(Icons.Default.Info, null) },
                                     onClick = { showMenu = false; navigate("journal") },
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Статистика") },
+                                    leadingIcon = { Icon(Icons.Default.BarChart, null) },
+                                    onClick = { showMenu = false; navigate("stats") },
                                 )
                                 DropdownMenuItem(
                                     text = { Text("DNS-серверы") },
@@ -801,11 +827,15 @@ private fun DnsEditorDialog(
     )
 }
 
-/// CF Worker: настройка собственного worker'а или реле (порт WorkerView).
+/// CF Worker: настройка собственных worker'ов или реле (порт WorkerView).
+/// Несколько доменов — через запятую, распределяются по соединениям
+/// round-robin (iOS build 90). «host:port» — прямое реле; микс
+/// доменов и реле в одном списке не поддерживается — реле одно.
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun WorkerScreen(navigate: (String) -> Unit) {
     var worker by remember { mutableStateOf(TunnelManager.workerDomain) }
+    var dcMap by remember { mutableStateOf(TunnelManager.dcMapText) }
     Scaffold(
         topBar = {
             TopAppBar(
@@ -828,7 +858,7 @@ private fun WorkerScreen(navigate: (String) -> Unit) {
             OutlinedTextField(
                 worker,
                 { worker = it },
-                label = { Text("worker.example.com или ip:port") },
+                label = { Text("worker.example.com, второй.example.com или ip:port") },
                 singleLine = true,
                 enabled = !TunnelManager.running,
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
@@ -837,15 +867,38 @@ private fun WorkerScreen(navigate: (String) -> Unit) {
             Spacer(Modifier.height(8.dp))
             Button(onClick = {
                 TunnelManager.workerDomain = worker.trim()
+                TunnelManager.dcMapText = dcMap.trim()
                 navigate("main")
             }) { Text("Сохранить") }
             Spacer(Modifier.height(8.dp))
             Text(
                 when {
                     worker.isBlank() -> "Пусто = kws-фронты Cloudflare (основной режим)."
-                    worker.contains(":") -> "Прямой режим: сырой TCP на реле host:port, без CF."
-                    else -> "Pipe-режим через свой CF worker. Перезапусти туннель, чтобы применилось."
+                    worker.contains(":") -> "Прямой режим: сырой TCP на реле host:port, без CF. Реле одно — запятые не для него."
+                    else -> "Pipe-режим через свои CF worker'ы. Несколько доменов — через " +
+                        "запятую: соединения распределяются между ними по кругу, CF не " +
+                        "троттлит один домен. Перезапусти туннель, чтобы применилось."
                 },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
+            )
+            Spacer(Modifier.height(20.dp))
+            Text("DC → IP (pipe-режим)", style = MaterialTheme.typography.titleMedium)
+            Spacer(Modifier.height(8.dp))
+            OutlinedTextField(
+                dcMap,
+                { dcMap = it },
+                label = { Text("2:1.2.3.4") },
+                // Мульти-строчное: формат — строка на запись, переносами
+                // удобнее править список из нескольких DC.
+                modifier = Modifier.fillMaxWidth(),
+                enabled = !TunnelManager.running,
+            )
+            Spacer(Modifier.height(8.dp))
+            Text(
+                "Переназначение адреса для pipe-worker'а: строки «номер:IP» по одной " +
+                    "на строку (например, 2:1.2.3.4). Пусто = диалить канонический адрес " +
+                    "датацентра, как прилетело. Битые строки молча пропускаются.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
             )
@@ -911,7 +964,8 @@ private fun JournalScreen(navigate: (String) -> Unit) {
     }
 }
 
-/// О программе (порт AboutView).
+/// О программе (порт AboutView, iOS build 93): короткое сухое резюме +
+/// ссылки. Без блока автора — версии и ссылки говорят всё.
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun AboutScreen(navigate: (String) -> Unit) {
@@ -940,22 +994,21 @@ private fun AboutScreen(navigate: (String) -> Unit) {
             Spacer(Modifier.height(8.dp))
             Text("WSBridge", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
             Text(
-                // 0.2.N — единый формат везде: N и есть versionCode.
+                // Маркетинговая semver (wsb.version); номер сборки (versionCode)
+                // в UI не дублируется — он для механизма обновлений, не для глаз.
                 BuildConfig.VERSION_NAME,
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
             )
             Spacer(Modifier.height(24.dp))
-            Text("Что это", style = MaterialTheme.typography.titleMedium, modifier = Modifier.fillMaxWidth())
-            Spacer(Modifier.height(8.dp))
             Text(
-                "WSBridge — VPN-туннель, работающий локально на вашем устройстве. Он перехватывает трафик Telegram и перенаправляет его через WebSocket-соединение к серверам Telegram в обход блокировок. Настройка в самом Telegram не требуется.",
+                "Локальный VPN-туннель: перехватывает трафик настроенных префиксов " +
+                    "и переносит его через WebSocket-поток. Работает целиком на " +
+                    "устройстве, без внешнего сервера. Настройка в целевом " +
+                    "приложении не требуется.",
                 style = MaterialTheme.typography.bodyMedium,
             )
             Spacer(Modifier.height(24.dp))
-            Text("Разработчик", style = MaterialTheme.typography.titleMedium, modifier = Modifier.fillMaxWidth())
-            Spacer(Modifier.height(8.dp))
-            LinkRow("Автор: l1ratch", null)
             LinkRow("Исходный код WSBridge-Android") {
                 context.openUrl("https://github.com/l1ratch/WSBridge-Android")
             }

@@ -15,12 +15,14 @@ android {
     compileSdk = (project.findProperty("wsb.compileSdk") as String?)?.toIntOrNull()
         ?: libs.versions.android.compileSdk.get().toInt()
 
-    // ── Версия: единый источник ─────────────────────────────────────
-    // wsb.build из gradle.properties — единственное число для релиза.
-    // В CI номер прогона (BUILD_NUMBER) должен только РАСТИ, чтобы
-    // versionCode не откатился назад и обновление осталось возможным:
-    // берём максимум из wsb.build и BUILD_NUMBER.
+    // ── Версия: ДВА числа, источник — gradle.properties ───────────────
+    // wsb.build  — номер сборки, монотонный, кормит versionCode. CI
+    //              передаёт BUILD_NUMBER = wsb.build, так что max() —
+    //              защита от случайного расхождения, а не источник.
+    // wsb.version — маркетинговая semver (0.3.0), кормит versionName и
+    //              проверку тега релиза; от номера сборки НЕ зависит.
     val wsbBuild = (project.findProperty("wsb.build") as String?)?.toIntOrNull() ?: 1
+    val wsbVersion = (project.findProperty("wsb.version") as String?) ?: "0.0.0"
     val ciBuild = System.getenv("BUILD_NUMBER")?.toIntOrNull() ?: 0
     val buildNo = maxOf(wsbBuild, ciBuild)
     // Нативная сборка выключается ключом -Pwsb.native=false (по умолчанию — вкл).
@@ -31,8 +33,9 @@ android {
         minSdk = libs.versions.android.minSdk.get().toInt()
         targetSdk = libs.versions.android.targetSdk.get().toInt()
         versionCode = buildNo
-        // 0.2.N, где N и есть versionCode — дублировать номер в UI незачем.
-        versionName = "0.2.$buildNo"
+        // Маркетинговая версия отдельно от номера сборки: numberCode в UI
+        // не дублирует, тег релиза совпадает с versionName.
+        versionName = wsbVersion
         if (nativeBuild) {
             ndk {
                 abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")

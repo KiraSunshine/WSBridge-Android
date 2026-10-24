@@ -121,12 +121,14 @@ XBox DNS / Alt Malw.link, у каждого — ссылка на сайт пр�
 
 ## Сборка
 
-Версия живёт в одном месте: `wsb.build` в `gradle.properties`. Из него
-выводятся `versionName` (`0.2.N`) и `versionCode` (`N`); оба воркфлоу CI
-передают это же число как `BUILD_NUMBER`, поэтому preview и релиз несут один
-растущий `versionCode` и ставятся друг поверх друга. Релизный воркфлоу не
-собирается, если проставленный тег (`v0.2.N`) не совпадает с `wsb.build`, —
-номер поднимают в `gradle.properties` до тега.
+Версия — два числа в `gradle.properties`: `wsb.build` — монотонный номер
+сборки, кормит `versionCode`, и `wsb.version` — маркетинговая semver
+(`0.3.0`), кормит `versionName`. Оба воркфлоу CI передают `wsb.build` как
+`BUILD_NUMBER`, поэтому preview и релиз несут один растущий `versionCode` и
+ставятся друг поверх друга. Релизный воркфлоу не собирается, если тег
+(`v0.3.0`) не совпадает с `wsb.version` или если `wsb.build` оказался бы
+ниже уже опубликованного preview, — номер поднимают в `gradle.properties`
+с каждым пушем, а `wsb.version` меняют осознанно на релизах.
 
 - Gradle wrapper; CI (GitHub Actions) собирает подписанный APK при каждом
   пуше в `main` и публикует в prerelease `preview`.

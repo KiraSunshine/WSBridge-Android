@@ -15,14 +15,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ── Версия: единственный источник — wsb.build ──────────────────────
-      # app/build.gradle.kts считает buildNo = max(wsb.build, BUILD_NUMBER),
-      # versionCode = buildNo, versionName = "0.2.$buildNo". Раньше preview
-      # брал сюда github.run_number: счётчик прогонов растёт сам по себе,
-      # обгонял wsb.build, и установить релиз поверх такого preview Android
-      # отказывался («App not installed»). Теперь и preview, и релиз берут
-      # одно число — wsb.build. Явная проверка нужна, чтобы отсутствие
-      # ключа не превратилось молча в versionCode = 1 (фолбэк в Gradle).
+      # ── Версия: ДВА числа, источник — gradle.properties ──────────────
+      # wsb.build — монотонный номер сборки → versionCode (max с BUILD_NUMBER
+      # в Gradle). wsb.version — маркетинговая semver → versionName.
+      # Раньше preview брал сюда github.run_number: счётчик прогонов растёт
+      # сам по себе, обгонял wsb.build, и установить релиз поверх такого
+      # preview Android отказывался («App not installed»). Теперь и preview,
+      # и релиз берут одно число — wsb.build. Явная проверка нужна, чтобы
+      # отсутствие ключа не превратилось молча в versionCode = 1 (фолбэк
+      # в Gradle).
       - name: Read version
         id: ver
         run: |
@@ -31,8 +32,13 @@ jobs:
           case "$BUILD" in
             ''|*[!0-9]*) echo "::error::wsb.build не найден или не число в gradle.properties"; exit 1 ;;
           esac
+          VERSION=$(grep -E '^[[:space:]]*wsb\.version[[:space:]]*=' gradle.properties | tail -n 1 | cut -d= -f2 | tr -d '[:space:]' || true)
+          case "$VERSION" in
+            ''|*[!0-9A-Za-z.\-+]*) echo "::error::wsb.version не найден в gradle.properties"; exit 1 ;;
+          esac
           echo "build=$BUILD" >> "$GITHUB_OUTPUT"
-          echo "wsb.build=$BUILD → versionName 0.2.$BUILD, versionCode $BUILD"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "wsb.build=$BUILD → versionCode $BUILD; wsb.version=$VERSION → versionName"
 
       - name: Set up JDK 21
         uses: actions/setup-java@v5
@@ -79,6 +85,8 @@ jobs:
       # совпадает с номером ближайшего релиза, поэтому и preview, и релиз
       # ставятся друг поверх друга. Номер поднимается вручную в
       # gradle.properties перед тегом (релизный воркфлоу это проверяет).
+      # «Build N» в notes — маркер: релизный guard читает его и не даёт
+      # выпустить релиз с versionCode ниже уже опубликованного preview.
       - name: Update preview release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -88,5 +96,5 @@ jobs:
           gh release create preview \
             dist/WSBridge.apk \
             --title "Preview (latest main)" \
-            --notes "Дев-сборка с последнего пуша в main. Для стабильных версий — Releases." \
+            --notes "Дев-сборка с последнего пуша в main (build ${{ steps.ver.outputs.build }}). Для стабильных версий — Releases." \
             --prerelease
