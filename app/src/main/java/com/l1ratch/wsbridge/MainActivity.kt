@@ -8,6 +8,7 @@ import android.os.Bundle
 import android.net.Uri
 import android.util.Log
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
@@ -50,6 +51,8 @@ import androidx.compose.material3.FilledIconButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.NavigationBar
+import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
@@ -212,6 +215,9 @@ fun App(onToggle: () -> Unit, onRestart: () -> Unit) {
     // давала блёклые экраны, а градиенты под светлую ломали контраст.
     MaterialTheme(colorScheme = darkColorScheme(background = DarkBg, surface = DarkBg)) {
         var screen by remember { mutableStateOf<Any>("main") }
+        // Системная кнопка «Назад» на любом разделе возвращает на главный экран,
+        // а не закрывает приложение. Внутри разделов свои стрелки «назад» уже есть.
+        BackHandler(enabled = screen != "main") { screen = "main" }
         when (screen) {
             "main" -> MainScreen(onToggle = onToggle, onRestart = onRestart, navigate = { screen = it })
             "dnsManage" -> DnsManageScreen(navigate = { screen = it })
@@ -317,29 +323,6 @@ private fun MainScreen(onToggle: () -> Unit, onRestart: () -> Unit, navigate: (S
                             }
                             DropdownMenu(expanded = showMenu, onDismissRequest = { showMenu = false }) {
                                 DropdownMenuItem(
-                                    text = { Text("Журнал туннеля") },
-                                    leadingIcon = { Icon(Icons.Default.Info, null) },
-                                    onClick = { showMenu = false; navigate("journal") },
-                                )
-                                DropdownMenuItem(
-                                    text = { Text("DNS-серверы") },
-                                    leadingIcon = { Icon(Icons.Default.NetworkWifi, null) },
-                                    onClick = { showMenu = false; navigate("dnsManage") },
-                                )
-                                DropdownMenuItem(
-                                    text = { Text("CF Worker") },
-                                    leadingIcon = { Icon(Icons.Default.Cloud, null) },
-                                    onClick = { showMenu = false; navigate("worker") },
-                                )
-                                DropdownMenuItem(
-                                    text = { Text("Обновить фронты (${CFDomains.size})") },
-                                    leadingIcon = { Icon(Icons.Default.Refresh, null) },
-                                    onClick = {
-                                        showMenu = false
-                                        if (frontsStatus == null) frontsStatus = "run"
-                                    },
-                                )
-                                DropdownMenuItem(
                                     text = { Text("О программе") },
                                     leadingIcon = { Icon(Icons.Default.Info, null) },
                                     onClick = { showMenu = false; navigate("about") },
@@ -366,7 +349,18 @@ private fun MainScreen(onToggle: () -> Unit, onRestart: () -> Unit, navigate: (S
                     },
                     colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent),
                 )
-            }
+            },
+            bottomBar = {
+                MainBottomBar(
+                    onJournal = { navigate("journal") },
+                    onDns = { navigate("dnsManage") },
+                    onWorker = { navigate("worker") },
+                    onRefreshFronts = {
+                        if (frontsStatus == null) frontsStatus = "run"
+                    },
+                    refreshingFronts = frontsStatus == "run",
+                )
+            },
         ) { padding ->
             Box(Modifier.fillMaxSize().padding(padding)) {
                 Column(
@@ -436,6 +430,50 @@ private fun MainScreen(onToggle: () -> Unit, onRestart: () -> Unit, navigate: (S
             dismissButton = {
                 TextButton(onClick = { NetworkMonitor.clearAlert() }) { Text("Позже") }
             },
+        )
+    }
+}
+
+/// Нижняя панель главного экрана. Сюда перенесены действия из меню «i»;
+/// в самом меню остались только «О программе» и ссылки на исходники.
+@Composable
+private fun MainBottomBar(
+    onJournal: () -> Unit,
+    onDns: () -> Unit,
+    onWorker: () -> Unit,
+    onRefreshFronts: () -> Unit,
+    refreshingFronts: Boolean,
+) {
+    NavigationBar(containerColor = Color(0xF20D1526)) {
+        NavigationBarItem(
+            selected = false,
+            onClick = onJournal,
+            icon = { Icon(Icons.Default.Info, null) },
+            label = { Text("Журнал") },
+        )
+        NavigationBarItem(
+            selected = false,
+            onClick = onDns,
+            icon = { Icon(Icons.Default.NetworkWifi, null) },
+            label = { Text("DNS") },
+        )
+        NavigationBarItem(
+            selected = false,
+            onClick = onWorker,
+            icon = { Icon(Icons.Default.Cloud, null) },
+            label = { Text("Worker") },
+        )
+        NavigationBarItem(
+            selected = false,
+            onClick = onRefreshFronts,
+            icon = {
+                if (refreshingFronts) {
+                    CircularProgressIndicator(Modifier.size(24.dp), strokeWidth = 2.dp)
+                } else {
+                    Icon(Icons.Default.Refresh, null)
+                }
+            },
+            label = { Text("Фронты") },
         )
     }
 }
