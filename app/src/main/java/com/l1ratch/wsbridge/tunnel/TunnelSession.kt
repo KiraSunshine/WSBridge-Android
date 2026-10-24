@@ -11,6 +11,9 @@ class TunnelSession(
     val connId: Long,
     private val dcIP: Long,
     private val workerDomain: String?,
+    /// Override «DC → IP» из настроек (iOS build 90): канонический адрес DC
+    /// → IP, который worker'у реально диалить. Пусто = как прилетело.
+    private val dcOverride: Map<String, String> = emptyMap(),
     private val bridge: LwipNative,
     private val queue: (Runnable) -> Unit,
 ) {
@@ -108,7 +111,14 @@ class TunnelSession(
 
     private fun startPipe() {
         val workerDomain = workerDomain ?: return
-        val dst = formatIp(dcIP)
+        var dst = formatIp(dcIP)
+        // «DC → IP»: если на канонический адрес DC в настройках назначен
+        // другой IP — worker диалит его, а не исходный (iOS build 90).
+        val overrideIP = dcOverride[dst]
+        if (!overrideIP.isNullOrEmpty()) {
+            postEvent("pipe_remap:$dst->$overrideIP")
+            dst = overrideIP
+        }
         postEvent("pipe:conn$connId:$dst" + if (dcIP == 0L) ":raw=0" else "")
         val ws = WSClient(tag = "c$connId")
         this.ws = ws
@@ -228,5 +238,41 @@ class TunnelSession(
     companion object {
         fun formatIp(ip: Long): String =
             "${(ip shr 24) and 255}.${(ip shr 16) and 255}.${(ip shr 8) and 255}.${ip and 255}"
+
+        // ── «DC → IP» маппинг (порт TunnelSession.swift, iOS build 90) ──
+
+        /// Канонические IPv4 главных датацентров. В pipe-режиме init не
+        /// парсится, DC-номер недоступен — матчим override по адресу назначения.
+        /// Таблица та же, что на iOS: конфиги переносятся между платформами.
+        val canonicalIPs: List<Pair<Int, String>> = listOf(
+            1 to "149.154.175.50",
+            2 to "149.154.167.220",
+            3 to "149.154.175.100",
+            4 to "149.154.167.91",
+            5 to "91.108.56.130",
+        )
+
+        /// Из строк «номер:IP» (по одной на строку) строит карту
+        /// канонический_IP_этого_DC → указанный_IP. Невалидные строки молча
+        /// пропускаются — список руками правит пользователь, ошибки тут не
+        /// фатальны.
+        fun parseDCOverride(rawText: String): Map<String, String> {
+            val canonByDC = canonicalIPs.toMap()
+            val map = HashMap<String, String>()
+            for (raw in rawText.lines()) {
+                val line = raw.trim()
+                if (line.isEmpty()) continue
+                val parts = line.split(":", limit = 2)
+                if (parts.size != 2) continue
+                val dc = parts[0].trim().toIntOrNull() ?: continue
+                val canon = canonByDC[dc] ?: continue
+                val ip = parts[1].trim()
+                // IP грубо валидируем: 4 октета числами 0–255.
+                val octets = ip.split(".").mapNotNull { it.toIntOrNull() }
+                if (octets.size != 4 || octets.any { it !in 0..255 }) continue
+                map[canon] = ip
+            }
+            return map
+        }
     }
 }

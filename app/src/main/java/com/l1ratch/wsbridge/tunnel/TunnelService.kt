@@ -50,6 +50,16 @@ class TunnelService : VpnService() {
     private var packetCount = 0L
     private var byteCount = 0L
 
+    // Работники из «домены через запятую» + счётчик round-robin (iOS build 90):
+    // распределяем соединения по доменам, чтобы CF не троттлил один и было
+    // разнесение нагрузки. Доступ — только с lwip-потока (onAccept).
+    private var workerDomains: List<String> = emptyList()
+    private var workerRRIndex = 0
+
+    /// «DC → IP» маппинг из настроек (iOS build 90). Читается на старте,
+    /// immutable на время сессии.
+    private var dcOverride: Map<String, String> = emptyMap()
+
     // lwipQueue: единственный поток, которому разрешено трогать lwIP и sessions.
     @Volatile private var lwipExecutor: ScheduledExecutorService? = null
     private var tunIn: FileInputStream? = null
@@ -101,7 +111,18 @@ class TunnelService : VpnService() {
         }
         if (starting || tunIn != null) return START_NOT_STICKY // уже работает или стартует
 
-        val workerDomain = TunnelManager.workerDomain.trim().takeIf { it.isNotEmpty() }
+        // Несколько worker-доменов через запятую (iOS build 90): каждый ходит
+        // отдельной сессией, распределяются round-robin. Пустые элементы режем.
+        val workerDomains = TunnelManager.workerDomain
+            .split(",")
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+        val workerDomain = workerDomains.firstOrNull()
+        // «DC → IP» маппинг: строки «номер:IP».
+        val dcOverride = TunnelSession.parseDCOverride(TunnelManager.dcMapText)
+        this.workerDomains = workerDomains
+        this.workerRRIndex = 0
+        this.dcOverride = dcOverride
         val dns = TunnelManager.selectedDNS
 
         // startForeground обязан успеть в 5с после startForegroundService —
@@ -258,7 +279,9 @@ class TunnelService : VpnService() {
         tunOut = FileOutputStream(tun.fileDescriptor)
 
         EventLog.reset()
-        EventLog.append("cfg:worker=${workerDomain ?: "-"}")
+        // Несколько доменов видим в журнале сразу: «cfg:worker=first(xN)».
+        EventLog.append("cfg:worker=${workerDomain ?: "-"}(x${workerDomains.size})")
+        if (dcOverride.isNotEmpty()) EventLog.append("cfg:dc_map=${dcOverride.size}")
         EventLog.append("tunnel_start v${BuildConfig.VERSION_NAME}")
         // Скачанные фронты применяются при каждом старте туннеля. FrontsUpdater
         // уже читает prefs при init — здесь страховка на случай, если сервис
@@ -266,6 +289,9 @@ class TunnelService : VpnService() {
         FrontsUpdater.init(applicationContext)
         EventLog.append("fronts:${CFDomains.size}d")
         TunnelManager.updateRunning(true)
+        // Сессия пошла: счётчик включений и база дельт для статистики.
+        // EventLog только что обнулился — первый snapshot возьмёт чистую базу.
+        StatsStore.noteSessionStart()
 
         lwipExecutor = Executors.newSingleThreadScheduledExecutor { r ->
             Thread(r, "wsb-lwip").apply { isDaemon = true }
@@ -330,6 +356,10 @@ class TunnelService : VpnService() {
     private fun stopTunnel() {
         if (stopped && tunIn == null) { stopSelf(); return }
         EventLog.append("tunnel_stop:user:pkts=$packetCount")
+        // Финальный снапшот статистики ДО разборки (iOS build 92): после
+        // остановки счётчики уже не растут, и последняя дельта байтов
+        // (последний io-тик) без этого терялась бы навсегда.
+        finalizeStats()
         // Старт мог ещё идти: гасим сторож, иначе он пальнёт start_stall
         // уже после осознанной остановки, которую сам же пользователь и сделал.
         // Обнуляем и поколение: попытка, чей establish() ещё висит, станет
@@ -371,7 +401,16 @@ class TunnelService : VpnService() {
             override fun onOutput(packet: ByteArray) = writePacket(packet)
             override fun onAccept(connId: Long, dcIp: Long) {
                 EventLog.append("accept:c$connId")
-                sessions[connId] = TunnelSession(connId, dcIp, workerDomain, lwip) { r ->
+                // Несколько worker'ов: round-robin, чтобы CF не троттлил
+                // один домен (iOS build 90). Один домен — как раньше.
+                val domain: String? = if (workerDomains.size > 1) {
+                    val d = workerDomains[workerRRIndex % workerDomains.size]
+                    workerRRIndex += 1
+                    d
+                } else {
+                    workerDomain
+                }
+                sessions[connId] = TunnelSession(connId, dcIp, domain, dcOverride, lwip) { r ->
                     if (!stopped) lwipExecutor?.execute(r)
                 }
             }
@@ -410,6 +449,10 @@ class TunnelService : VpnService() {
 
         executor.scheduleAtFixedRate({
             if (stopped) return@scheduleAtFixedRate
+            // Статистика по дням капается событийно — прямо с этого же тика
+            // (15с), без отдельных таймеров и без будки батареи (iOS build 91).
+            // rxBytes = от клиента, upBytes = к клиенту (см. StatsStore).
+            StatsStore.snapshot(EventLog.rxBytes, EventLog.upBytes)
             EventLog.append(
                 "io:in=$packetCount out=${EventLog.outPkts} v6=${EventLog.inV6} oth=${EventLog.inOther} " +
                     "wd=${EventLog.wsDown} wf=${EventLog.writeFails} up=${EventLog.upBytes} rx=${EventLog.rxBytes} " +
@@ -434,6 +477,7 @@ class TunnelService : VpnService() {
                         // без io: и без причины).
                         Log.e(TAG, "tun read failed: ${e.message}")
                         EventLog.append("tun_dead:read:${e.javaClass.simpleName}:${e.message}")
+                        finalizeStats()
                         TunnelManager.updateRunning(false)
                     }
                     break
@@ -486,12 +530,26 @@ class TunnelService : VpnService() {
             .setContentText("Туннель активен · $dnsName")
             .setContentIntent(pi)
             .setOngoing(true)
+            // Аналог Live Activity (iOS build 96+): таймер аптайма рисует СИСТЕМА
+            // по setWhen — сам обновляется каждую секунду, без наших будок
+            // батареи. ActivityKit на Android нет, но системный хронометр
+            // уведомления — тот же контракт «молния + время работы».
+            .setUsesChronometer(true)
+            .setWhen(System.currentTimeMillis())
             .build()
         if (Build.VERSION.SDK_INT >= 34) {
             startForeground(NOTIF_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED)
         } else {
             startForeground(NOTIF_ID, notification)
         }
+    }
+
+    /// Финальный снапшот статистики: дельта байтов + хвост аптайма, затем
+    /// закрытие сессии в сторе. Идемпотентен — все пути смерти зовут его,
+    /// повторный вызов после закрытия ничего не начислит.
+    private fun finalizeStats() {
+        StatsStore.snapshot(EventLog.rxBytes, EventLog.upBytes)
+        StatsStore.noteSessionEnd()
     }
 
     /// Закрываем именно ParcelFileDescriptor: его close() гарантированно будит
@@ -506,6 +564,7 @@ class TunnelService : VpnService() {
     override fun onRevoke() {
         // Система отзывает VPN (пользователь выключил в настройках / другой VPN).
         EventLog.append("tunnel_stop:revoked:pkts=$packetCount")
+        finalizeStats()
         // Остановка гасит сторож ТЕКУЩЕГО поколения: своего владельца у него
         // уже нет (сессия кончилась), а чужой не трогаем — им владеет новая.
         disarmWatchdog(startWatchdogGen)
@@ -527,6 +586,9 @@ class TunnelService : VpnService() {
     override fun onDestroy() {
         stopped = true
         disarmWatchdog(startWatchdogGen)
+        // Статистика: страховка для путей, не прошедших через stopTunnel/
+        // onRevoke (start_fail:*, establish_null, tun_dead).
+        finalizeStats()
         // Страховка на пути, которые до сюда не дошли (start_fail:*,
         // establish_null, tun_dead): сервис умирает всегда, а монитор сети и
         // нудж 6ч не должны пережить его. Оба вызова идемпотентны.

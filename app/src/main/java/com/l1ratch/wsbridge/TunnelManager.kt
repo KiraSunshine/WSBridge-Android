@@ -137,10 +137,19 @@ object TunnelManager {
     fun statusHistory(): List<String> = synchronized(transitions) { transitions.toList() }
 
     /// Домен собственного CF worker'а пользователя (pipe-режим). пустой = kws-каскад.
-    /// «host:port» = прямое реле на VPS.
+    /// «host:port» = прямое реле на VPS. Несколько доменов — через запятую
+    /// (балансировка round-robin на каждое соединение, как в iOS build 90).
     var workerDomain: String
         get() = prefs.getString("workerDomain", "") ?: ""
         set(v) = prefs.edit().putString("workerDomain", v).apply()
+
+    /// «DC → IP» маппинг (как в десктопном tg-ws-proxy и iOS build 90):
+    /// строки «номер:IP» по одной на строку. Пусто = как прилетело от клиента.
+    /// Работает в pipe-режиме: worker'у диалится указанный IP вместо
+    /// канонического адреса DC.
+    var dcMapText: String
+        get() = prefs.getString("dcMap", "") ?: ""
+        set(v) = prefs.edit().putString("dcMap", v).apply()
 
     /// Выбранный транспорт шифрованного DNS (по умолчанию DoT).
     var dnsModeRaw: String
