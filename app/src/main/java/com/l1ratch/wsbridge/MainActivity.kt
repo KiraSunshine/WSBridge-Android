@@ -8,21 +8,32 @@ import android.os.Bundle
 import android.net.Uri
 import android.util.Log
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.PagerState
+import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -30,24 +41,25 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.List
 import androidx.compose.material.icons.filled.BarChart
 import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.ChevronLeft
+import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.NetworkWifi
+import androidx.compose.material.icons.filled.OpenInBrowser
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.DropdownMenu
-import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
-import androidx.compose.material3.FilledIconButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -58,13 +70,14 @@ import androidx.compose.material3.Snackbar
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
-import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.darkColorScheme
+import androidx.compose.material3.ripple
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -72,6 +85,8 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Brush.Companion.radialGradient
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
@@ -232,6 +247,11 @@ fun App(onToggle: () -> Unit, onRestart: () -> Unit) {
     // давала блёклые экраны, а градиенты под светлую ломали контраст.
     MaterialTheme(colorScheme = darkColorScheme(background = DarkBg, surface = DarkBg)) {
         var screen by remember { mutableStateOf<Any>("main") }
+        // Системный «назад» из подраздела — на главную, а не выход из
+        // приложения. В подразделах свайп страниц не работает (это отдельные
+        // экраны), поэтому жест назад — единственный путь обратно; так же
+        // ведёт себя кнопка-стрелка в тулбаре.
+        BackHandler(enabled = screen != "main") { screen = "main" }
         when (screen) {
             "main" -> MainScreen(onToggle = onToggle, onRestart = onRestart, navigate = { screen = it })
             "dnsManage" -> DnsManageScreen(navigate = { screen = it })
@@ -243,18 +263,14 @@ fun App(onToggle: () -> Unit, onRestart: () -> Unit) {
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun MainScreen(onToggle: () -> Unit, onRestart: () -> Unit, navigate: (String) -> Unit) {
     val running = TunnelManager.running
-    val ctx = LocalContext.current
-    var showMenu by remember { mutableStateOf(false) }
     var showDns by remember { mutableStateOf(false) }
-    // Ручное обновление фронтов: null = не идёт, "run" = качает, "ok:N"/"err" = итог,
-    // "stale:…" = источник ответил, но список негодный (сеть при этом жива).
+    // Ручное обновление фронтов: null = не идёт, "run" = качает, "ok:N"/"stale:…"/"offline" = итог.
     var frontsStatus by remember { mutableStateOf<String?>(null) }
 
-    // Клик меню ставит "run" → этот эффект один раз скачивает и пишет итог.
+    // Клик по строке «Обновить фронты» ставит "run" → эффект один раз качает.
     LaunchedEffect(frontsStatus) {
         when (frontsStatus) {
             "run" -> {
@@ -273,148 +289,46 @@ private fun MainScreen(onToggle: () -> Unit, onRestart: () -> Unit, navigate: (S
         }
     }
 
-    // Фон рисуем явно: Scaffold прозрачный (иначе перекроет свечения), а окно
-    // в XML-теме чёрное — без этой заливки светлая тема давала чёрный экран.
-    // Тема всегда тёмная (см. App).
+    // Две страницы вместо popup-меню: главная и «Другое». Свайп листает,
+    // точки внизу показывают, где ты и куда можно листнуть. Подразделы
+    // (DNS, журнал, статистика…) — отдельные экраны, поэтому внутри них
+    // свайпа страниц нет: работает только «назад» (жест или стрелка).
+    val pagerState = rememberPagerState(pageCount = { 2 })
+    val scope = rememberCoroutineScope()
+
+    // Системный «назад» со второй страницы — на главную, а не выход из
+    // приложения: так жест совпадает с ожиданием «листнул — вернулся».
+    BackHandler(enabled = pagerState.currentPage != 0) {
+        scope.launch { pagerState.animateScrollToPage(0) }
+    }
+
     Box(Modifier.fillMaxSize().background(DarkBg)) {
-        // Верхнее свечение (порт ContentView.swift): зелёное при работе, индиго в покое.
-        // Радиальный градиент вместо Modifier.blur — тот же вид, без дорогого размытия.
-        Box(
-            Modifier
-                .align(Alignment.TopCenter)
-                .size(560.dp)
-                .offset(y = (-240).dp)
-                .background(
-                    Brush.radialGradient(
-                        listOf(
-                            (if (running) Green else Indigo).copy(alpha = 0.55f),
-                            Color.Transparent,
-                        ),
-                        radius = px(300.dp),
-                    )
-                )
-        )
-        // Нижняя глубина: почти чёрный, держит низ экрана спокойным.
-        Box(
-            Modifier
-                .align(Alignment.BottomCenter)
-                .size(700.dp)
-                .offset(y = 220.dp)
-                .background(
-                    Brush.radialGradient(
-                        listOf(
-                            BottomDark.copy(alpha = 0.85f),
-                            Color.Transparent,
-                        ),
-                        radius = px(340.dp),
-                    )
-                )
-        )
+        BackgroundGlow(running)
 
-        Scaffold(
-            containerColor = Color.Transparent,
-            // contentColorFor(Transparent) не находит пару и отдаёт Unspecified,
-            // тогда LocalContentColor остаётся дефолтным чёрным — и в тёмной теме
-            // подпись DNS и иконка рисуются чёрным по тёмному. Задаём явно.
-            contentColor = MaterialTheme.colorScheme.onBackground,
-            topBar = {
-                TopAppBar(
-                    title = { },
-                    actions = {
-                        // Меню якоряется на коробке вокруг кнопки, иначе popup
-                        // открывается от левого края, а не под кнопкой.
-                        // Пузырь-кнопка (FilledIconButton) вместо голых «⋮»:
-                        // три точки были еле заметны на градиенте.
-                        Box {
-                            FilledIconButton(
-                                onClick = { showMenu = true },
-                                modifier = Modifier.size(48.dp),
-                            ) {
-                                Icon(
-                                    Icons.Default.Info,
-                                    contentDescription = "Меню",
-                                    modifier = Modifier.size(26.dp),
-                                )
-                            }
-                            DropdownMenu(expanded = showMenu, onDismissRequest = { showMenu = false }) {
-                                DropdownMenuItem(
-                                    text = { Text("Журнал туннеля") },
-                                    leadingIcon = { Icon(Icons.Default.Info, null) },
-                                    onClick = { showMenu = false; navigate("journal") },
-                                )
-                                DropdownMenuItem(
-                                    text = { Text("Статистика") },
-                                    leadingIcon = { Icon(Icons.Default.BarChart, null) },
-                                    onClick = { showMenu = false; navigate("stats") },
-                                )
-                                DropdownMenuItem(
-                                    text = { Text("DNS-серверы") },
-                                    leadingIcon = { Icon(Icons.Default.NetworkWifi, null) },
-                                    onClick = { showMenu = false; navigate("dnsManage") },
-                                )
-                                DropdownMenuItem(
-                                    text = { Text("CF Worker") },
-                                    leadingIcon = { Icon(Icons.Default.Cloud, null) },
-                                    onClick = { showMenu = false; navigate("worker") },
-                                )
-                                DropdownMenuItem(
-                                    text = { Text("Обновить фронты (${CFDomains.size})") },
-                                    leadingIcon = { Icon(Icons.Default.Refresh, null) },
-                                    onClick = {
-                                        showMenu = false
-                                        if (frontsStatus == null) frontsStatus = "run"
-                                    },
-                                )
-                                DropdownMenuItem(
-                                    text = { Text("О программе") },
-                                    leadingIcon = { Icon(Icons.Default.Info, null) },
-                                    onClick = { showMenu = false; navigate("about") },
-                                )
-                                HorizontalDivider()
-                                // Ссылки на репозитории (как в iOS-меню): свой
-                                // исходник и апстрим портируемой логики.
-                                DropdownMenuItem(
-                                    text = { Text("Исходный код") },
-                                    onClick = {
-                                        showMenu = false
-                                        ctx.openUrl("https://github.com/l1ratch/WSBridge-Android")
-                                    },
-                                )
-                                DropdownMenuItem(
-                                    text = { Text("Исходная логика") },
-                                    onClick = {
-                                        showMenu = false
-                                        ctx.openUrl("https://github.com/Flowseal/tg-ws-proxy")
-                                    },
-                                )
-                            }
-                        }
-                    },
-                    colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent),
-                )
-            }
-        ) { padding ->
-            Box(Modifier.fillMaxSize().padding(padding)) {
-                Column(
-                    modifier = Modifier.fillMaxSize(),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.Center,
-                ) {
-                    BoltButton(running, onToggle)
-                    Spacer(Modifier.height(20.dp))
-                    DnsPill { showDns = true }
+        Column(Modifier.fillMaxSize()) {
+            HorizontalPager(
+                state = pagerState,
+                modifier = Modifier.weight(1f),
+            ) { page ->
+                when (page) {
+                    0 -> HomePage(running = running, onToggle = onToggle, onDnsClick = { showDns = true })
+                    else -> OtherPage(
+                        frontsStatus = frontsStatus,
+                        onUpdateFronts = { if (frontsStatus == null) frontsStatus = "run" },
+                        navigate = navigate,
+                    )
                 }
-
-                // Версия — по нижнему краю, как на iOS. Только маркетинговая
-                // версия (0.2.N): её последнее число и есть номер сборки,
-                // дублировать его в скобках незачем.
-                Text(
-                    "v${BuildConfig.VERSION_NAME} · © 2026 l1ratch",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f),
-                    modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 16.dp),
-                )
             }
+
+            // Копирайт и точки страниц — общий низ экрана, точки ПОД копирайтом.
+            Text(
+                "v${BuildConfig.VERSION_NAME} · © 2026 l1ratch",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.45f),
+                textAlign = TextAlign.Center,
+                modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+            )
+            PageDots(pagerState, Modifier.padding(top = 8.dp, bottom = 16.dp))
         }
     }
 
@@ -466,34 +380,260 @@ private fun MainScreen(onToggle: () -> Unit, onRestart: () -> Unit, navigate: (S
     }
 }
 
-/// Молния — и индикатор, и кнопка. Ореол сделан радиальным градиентом, а не
-/// shadow(): тень от CircleShape на части устройств рисуется многоугольником,
-/// и кнопка выглядит как обрезанный октагон.
+/// Фон экрана: одно мягкое свечение сверху. Раньше было два радиальных
+/// градиента (сверху и снизу) — на больших радиусах они давали видимые полосы
+/// и «обрезки» свечения (тестер прислал скриншот). Вертикальный градиент на
+/// всю ширину гладкий: нет ни ступенек, ни границ бокса.
 @Composable
-private fun BoltButton(running: Boolean, onToggle: () -> Unit) {
+private fun BackgroundGlow(running: Boolean) {
+    val accent = if (running) Green else Indigo
     Box(
-        modifier = Modifier
-            .size(240.dp)
+        Modifier
+            .fillMaxWidth()
+            .fillMaxHeight(0.5f)
             .background(
-                Brush.radialGradient(
-                    listOf(
-                        // В покое — приглушённый индиго (не серый: серый читался
-                        // как «сломано»), при работе — зелёное свечение.
-                        (if (running) Green else Indigo).copy(alpha = if (running) 0.35f else 0.16f),
-                        Color.Transparent,
-                    ),
-                    radius = px(120.dp),
+                Brush.verticalGradient(
+                    0f to accent.copy(alpha = if (running) 0.20f else 0.12f),
+                    0.5f to accent.copy(alpha = 0.04f),
+                    1f to Color.Transparent,
                 )
             )
-            .clickable(onClick = onToggle),
-        contentAlignment = Alignment.Center,
+    )
+}
+
+/// Страница 1: молния и выбор DNS.
+@Composable
+private fun HomePage(running: Boolean, onToggle: () -> Unit, onDnsClick: () -> Unit) {
+    Column(
+        modifier = Modifier.fillMaxSize(),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center,
+    ) {
+        BoltButton(running, onToggle)
+        Spacer(Modifier.height(28.dp))
+        DnsPill(onClick = onDnsClick)
+    }
+}
+
+/// Страница 2: всё, что раньше лежало в popup-меню. Popup на Android
+/// выглядел чужеродно (Material-меню поверх собственного фона), а строки дают
+/// крупные тап-зоны, иконки и подписи с текущим состоянием.
+@Composable
+private fun OtherPage(
+    frontsStatus: String?,
+    onUpdateFronts: () -> Unit,
+    navigate: (String) -> Unit,
+) {
+    val ctx = LocalContext.current
+    val dns = TunnelManager.selectedDNS
+    val worker = TunnelManager.workerDomain.trim()
+    Column(
+        Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 20.dp)
+            .padding(top = 28.dp, bottom = 8.dp),
+    ) {
+        Text("Другое", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
+        Spacer(Modifier.height(20.dp))
+
+        SectionLabel("Туннель")
+        OtherRow(Icons.AutoMirrored.Filled.List, "Журнал туннеля", "События и ошибки текущей сессии") {
+            navigate("journal")
+        }
+        OtherRow(Icons.Default.BarChart, "Статистика", "Трафик и аптайм по дням") {
+            navigate("stats")
+        }
+        OtherRow(Icons.Default.NetworkWifi, "DNS-серверы", "${dns.name} · ${dns.transportsLabel}") {
+            navigate("dnsManage")
+        }
+        OtherRow(
+            Icons.Default.Cloud,
+            "CF Worker",
+            if (worker.isEmpty()) "не задан · kws-фронты" else worker,
+        ) { navigate("worker") }
+        OtherRow(
+            Icons.Default.Refresh,
+            "Обновить фронты",
+            when {
+                frontsStatus == "run" -> "обновляю…"
+                frontsStatus == "offline" -> "источники недоступны"
+                frontsStatus?.startsWith("stale:") == true -> "источник ответил, список негодный"
+                frontsStatus?.startsWith("ok") == true -> "готово: ${frontsStatus.removePrefix("ok:")} доменов"
+                else -> "${CFDomains.size} доменов в каскаде"
+            },
+            enabled = frontsStatus == null,
+            onClick = onUpdateFronts,
+        )
+
+        Spacer(Modifier.height(18.dp))
+        SectionLabel("Приложение")
+        OtherRow(Icons.Default.Info, "О программе", "Версия, ссылки, лицензия") {
+            navigate("about")
+        }
+
+        Spacer(Modifier.height(18.dp))
+        SectionLabel("Ссылки")
+        OtherRow(Icons.Default.OpenInBrowser, "Исходный код", "github.com/l1ratch/WSBridge-Android") {
+            ctx.openUrl("https://github.com/l1ratch/WSBridge-Android")
+        }
+        OtherRow(Icons.Default.OpenInBrowser, "Исходная логика", "github.com/Flowseal/tg-ws-proxy") {
+            ctx.openUrl("https://github.com/Flowseal/tg-ws-proxy")
+        }
+    }
+}
+
+/// Заголовок группы строк.
+@Composable
+private fun SectionLabel(text: String) {
+    Text(
+        text.uppercase(),
+        style = MaterialTheme.typography.labelSmall,
+        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.45f),
+        modifier = Modifier.padding(start = 6.dp, bottom = 8.dp),
+    )
+}
+
+/// Строка-действие: иконка, заголовок, подпись-состояние, шеврон.
+@Composable
+private fun OtherRow(
+    icon: ImageVector,
+    title: String,
+    subtitle: String,
+    enabled: Boolean = true,
+    onClick: () -> Unit,
+) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .padding(vertical = 3.dp)
+            .clip(RoundedCornerShape(14.dp))
+            .background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.05f))
+            .clickable(enabled = enabled, onClick = onClick)
+            .padding(horizontal = 14.dp, vertical = 13.dp),
+        verticalAlignment = Alignment.CenterVertically,
     ) {
         Icon(
-            Icons.Default.Bolt,
-            contentDescription = if (running) "Выключить туннель" else "Включить туннель",
-            tint = if (running) Green else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.45f),
-            modifier = Modifier.size(170.dp),
+            icon, null,
+            tint = MaterialTheme.colorScheme.onSurface.copy(alpha = if (enabled) 0.75f else 0.3f),
+            modifier = Modifier.size(22.dp),
         )
+        Spacer(Modifier.size(14.dp))
+        Column(Modifier.weight(1f)) {
+            Text(
+                title,
+                style = MaterialTheme.typography.bodyLarge,
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = if (enabled) 1f else 0.45f),
+            )
+            Text(
+                subtitle,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f),
+            )
+        }
+        Icon(
+            Icons.Default.ChevronRight, null,
+            tint = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.25f),
+            modifier = Modifier.size(18.dp),
+        )
+    }
+}
+
+/// Индикатор страниц: две овальные точки + шевроны «куда можно листнуть».
+@Composable
+private fun PageDots(state: PagerState, modifier: Modifier = Modifier) {
+    Row(
+        modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.Center,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        val canLeft = state.currentPage > 0
+        val canRight = state.currentPage < state.pageCount - 1
+        Icon(
+            Icons.Default.ChevronLeft, null,
+            tint = MaterialTheme.colorScheme.onSurface.copy(alpha = if (canLeft) 0.45f else 0f),
+            modifier = Modifier.size(16.dp),
+        )
+        Spacer(Modifier.size(10.dp))
+        repeat(state.pageCount) { i ->
+            val selected = state.currentPage == i
+            val w by animateDpAsState(if (selected) 18.dp else 6.dp, tween(180), label = "dotW")
+            Box(
+                Modifier
+                    .height(6.dp)
+                    .width(w)
+                    .clip(CircleShape)
+                    .background(
+                        MaterialTheme.colorScheme.onSurface.copy(alpha = if (selected) 0.8f else 0.22f)
+                    )
+            )
+            if (i != state.pageCount - 1) Spacer(Modifier.size(6.dp))
+        }
+        Spacer(Modifier.size(10.dp))
+        Icon(
+            Icons.Default.ChevronRight, null,
+            tint = MaterialTheme.colorScheme.onSurface.copy(alpha = if (canRight) 0.45f else 0f),
+            modifier = Modifier.size(16.dp),
+        )
+    }
+}
+
+/// Молния — и индикатор, и кнопка.
+/// Клик-анимация ограничена кругом: раньше кликабельным был квадрат 240dp,
+/// и дефолтный ripple растекался по нему прямоугольником — на скриншоте это
+/// выглядело как светлый квадрат вокруг молнии. Теперь clip(CircleShape)
+/// стоит ДО clickable (ripple режется кругом), плюс лёгкое сжатие на нажатие.
+@Composable
+private fun BoltButton(running: Boolean, onToggle: () -> Unit) {
+    val accent = if (running) Green else Indigo
+    val interaction = remember { MutableInteractionSource() }
+    val pressed by interaction.collectIsPressedAsState()
+    val scale by animateFloatAsState(if (pressed) 0.94f else 1f, tween(120), label = "boltScale")
+
+    Box(contentAlignment = Alignment.Center) {
+        // Внешний ореол — отдельный некликабельный слой: иначе его площадь
+        // тоже ловила бы клик и ripple вне круга.
+        Box(
+            Modifier
+                .size(300.dp)
+                .background(
+                    Brush.radialGradient(
+                        0f to accent.copy(alpha = if (running) 0.16f else 0.08f),
+                        1f to Color.Transparent,
+                        radius = px(150.dp),
+                    )
+                )
+        )
+        Box(
+            modifier = Modifier
+                .size(240.dp)
+                .graphicsLayer {
+                    scaleX = scale
+                    scaleY = scale
+                }
+                .clip(CircleShape)
+                .background(
+                    Brush.radialGradient(
+                        0f to accent.copy(alpha = if (running) 0.30f else 0.14f),
+                        0.7f to accent.copy(alpha = if (running) 0.10f else 0.05f),
+                        1f to Color.Transparent,
+                        radius = px(120.dp),
+                    )
+                )
+                .clickable(
+                    interactionSource = interaction,
+                    indication = ripple(color = accent.copy(alpha = 0.22f), bounded = true),
+                    onClick = onToggle,
+                ),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(
+                Icons.Default.Bolt,
+                contentDescription = if (running) "Выключить туннель" else "Включить туннель",
+                tint = if (running) Green else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.45f),
+                modifier = Modifier.size(170.dp),
+            )
+        }
     }
 }
 

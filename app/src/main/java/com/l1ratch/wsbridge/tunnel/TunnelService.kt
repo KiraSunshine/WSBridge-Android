@@ -8,6 +8,8 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.net.VpnService
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.l1ratch.wsbridge.BuildConfig
@@ -39,6 +41,8 @@ class TunnelService : VpnService() {
         private const val TAG = "WSBridge"
         const val ACTION_START = "start"
         const val ACTION_STOP = "stop"
+        /// Перезапуск из уведомления (кнопка в шторке): стоп + старт.
+        const val ACTION_RESTART = "restart"
         private const val CHANNEL_ID = "tunnel"
         private const val NOTIF_ID = 1
         /// Сторож старта: столько секунд даём establish(), как 20с в iOS build 77.
@@ -107,6 +111,12 @@ class TunnelService : VpnService() {
         if (intent == null) { stopSelf(); return START_NOT_STICKY }
         if (intent.action == ACTION_STOP) {
             stopTunnel()
+            return START_NOT_STICKY
+        }
+        // Кнопка «Перезапустить» в шторке: сначала честно останавливаемся
+        // (TUN fd и контур lwIP освобождаются), потом поднимаем новую сессию.
+        if (intent.action == ACTION_RESTART) {
+            restartFromNotification()
             return START_NOT_STICKY
         }
         if (starting || tunIn != null) return START_NOT_STICKY // уже работает или стартует
@@ -352,6 +362,19 @@ class TunnelService : VpnService() {
         watchdogExecutor = null
     }
 
+    /// Перезапуск по кнопке в шторке: честный стоп, затем новый старт.
+    /// Старт ставим в очередь через 300мс — даём stopTunnel закрыть TUN fd и
+    /// погасить сторож, иначе новый onStartCommand увидит `starting`/`tunIn`
+    /// от прошлой сессии и молча откажется стартовать. startService из
+    /// уведомления разрешён: это действие пользователя, сервис foreground.
+    private fun restartFromNotification() {
+        EventLog.append("restart:notif")
+        stopTunnel()
+        Handler(Looper.getMainLooper()).postDelayed({
+            startService(Intent(this, TunnelService::class.java).setAction(ACTION_START))
+        }, 300)
+    }
+
     /// Остановка сервиса. Зовётся и из UI (ACTION_STOP), и сторожем старта.
     private fun stopTunnel() {
         if (stopped && tunIn == null) { stopSelf(); return }
@@ -524,6 +547,19 @@ class TunnelService : VpnService() {
             this, 0, Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
+        // Действия в шторке — Android-аналог кнопок Live Activity: управление
+        // туннелем без входа в приложение. «Выключить» — прямое ACTION_STOP,
+        // «Перезапустить» — стоп+старт (частая операция после смены сети).
+        // Стартовать выключенный туннель отсюда нельзя: Android 12+ запрещает
+        // поднимать FGS из фона, а уведомление живёт только пока сервис жив.
+        val stopPi = PendingIntent.getService(
+            this, 1, Intent(this, TunnelService::class.java).setAction(ACTION_STOP),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val restartPi = PendingIntent.getService(
+            this, 2, Intent(this, TunnelService::class.java).setAction(ACTION_RESTART),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
         val notification: Notification = NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle("WSBridge")
@@ -536,6 +572,8 @@ class TunnelService : VpnService() {
             // уведомления — тот же контракт «молния + время работы».
             .setUsesChronometer(true)
             .setWhen(System.currentTimeMillis())
+            .addAction(R.drawable.ic_notif_restart, "Перезапустить", restartPi)
+            .addAction(R.drawable.ic_notif_stop, "Выключить", stopPi)
             .build()
         if (Build.VERSION.SDK_INT >= 34) {
             startForeground(NOTIF_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED)
