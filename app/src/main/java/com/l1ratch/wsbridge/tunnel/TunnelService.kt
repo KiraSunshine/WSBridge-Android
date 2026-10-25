@@ -47,6 +47,10 @@ class TunnelService : VpnService() {
         private const val NOTIF_ID = 1
         /// Сторож старта: столько секунд даём establish(), как 20с в iOS build 77.
         private const val START_WATCHDOG_S = 20L
+        /// Сколько максимум ждём разборки старого контура при перезапуске из
+        /// шторки, прежде чем стартовать всё равно. 2с — с запасом на закрытие
+        /// fd и выход потока чтения; в норме условие выполняется за десятки мс.
+        private const val RESTART_SETTLE_MS = 2000L
     }
 
     private val lwip = LwipNative
@@ -66,7 +70,12 @@ class TunnelService : VpnService() {
 
     // lwipQueue: единственный поток, которому разрешено трогать lwIP и sessions.
     @Volatile private var lwipExecutor: ScheduledExecutorService? = null
-    private var tunIn: FileInputStream? = null
+    // Поток чтения TUN текущего контура. Нужен перезапуску из шторки: он ждёт
+    // реальной смерти предыдущего читателя, а не «примерно 300 мс».
+    @Volatile private var readThread: Thread? = null
+    // @Volatile: пишутся с main (startTunnel/closeTun), читаются с wsb-tun и
+    // с wsb-restart. Без этого перезапуск мог не увидеть, что fd уже закрыт.
+    @Volatile private var tunIn: FileInputStream? = null
     private var tunOut: FileOutputStream? = null
     private var dnsFd: android.os.ParcelFileDescriptor? = null
     private var dnsForwarder: DNSForwarder? = null
@@ -321,6 +330,12 @@ class TunnelService : VpnService() {
         if (startGen.get() != gen) {
             // Нас обнулили, пока поднимался контур: не оставляем вторую
             // поднятую VPN и не трогаем ни статус, ни чужой executor.
+            // Форвардер закрываем ЛОКАЛЬНО: он принадлежит нам (мы его только
+            // что создали), а в общем поле уже может быть чужой живой — не
+            // трогаем его через shutdownDnsForwarder(), чтобы не убить DNS
+            // новой сессии.
+            runCatching { dnsForwarder?.shutdown() }
+            dnsForwarder = null
             closeTun()
             return
         }
@@ -363,17 +378,66 @@ class TunnelService : VpnService() {
     }
 
     /// Перезапуск по кнопке в шторке: честный стоп, затем новый старт.
-    /// Старт ставим в очередь через 300мс — даём stopTunnel закрыть TUN fd и
-    /// погасить сторож, иначе новый onStartCommand увидит `starting`/`tunIn`
-    /// от прошлой сессии и молча откажется стартовать. startService из
-    /// уведомления разрешён: это действие пользователя, сервис foreground.
+    ///
+    /// Раньше старт ставился в очередь через фиксированные 300 мс. Это была
+    /// ставка на то, что teardown уложится в треть секунды: stopTunnel()
+    /// закрывает TUN fd, гасит lwipExecutor и форвардер, но НЕ ждёт, пока
+    /// поток чтения TUN реально выйдет из read(). Если он не успевал —
+    /// новый onStartCommand ловил guard `starting || tunIn != null` и молча
+    /// отбивал ACTION_START: кнопка «Перезапустить» не перезапускала ничего,
+    /// а в журнале не оставалось ни строки о причине (restart:notif был, а
+    /// tunnel_start — нет).
+    ///
+    /// Теперь ждём настоящего условия готовности (`isTornDown()`), а не время.
+    /// Ожидание — на отдельном потоке: onStartCommand приходит на main, и
+    /// усыплять его нельзя (это морозит интерфейс и сам VpnService).
+    /// Таймаут всё равно нужен: если teardown завис, лучше попытаться
+    /// стартовать и получить внятную строку в журнале, чем не сделать ничего.
     private fun restartFromNotification() {
         EventLog.append("restart:notif")
         stopTunnel()
-        Handler(Looper.getMainLooper()).postDelayed({
-            startService(Intent(this, TunnelService::class.java).setAction(ACTION_START))
-        }, 300)
+        Thread({
+            val startedAt = android.os.SystemClock.elapsedRealtime()
+            var waited = 0L
+            while (true) {
+                waited = android.os.SystemClock.elapsedRealtime() - startedAt
+                if (isTornDown() || waited >= RESTART_SETTLE_MS) break
+                try {
+                    Thread.sleep(25)
+                } catch (_: InterruptedException) {
+                    break
+                }
+            }
+            // Таймаут — не повод молчать: без этой строки «перезапуск не
+            // сработал» снова выглядел бы как немой отказ.
+            if (!isTornDown()) EventLog.append("restart:notif:settle_timeout:${waited}ms")
+            // startService из уведомления разрешён: это действие пользователя,
+            // сервис foreground. Через applicationContext — объект сервиса
+            // мог быть уничтожен stopSelf() выше, а база контекста жива.
+            val ctx = applicationContext
+            Handler(Looper.getMainLooper()).post {
+                try {
+                    ctx.startService(
+                        Intent(ctx, TunnelService::class.java).setAction(ACTION_START)
+                    )
+                } catch (t: Throwable) {
+                    // Запрет фонового старта (Android 12+) или мёртвый процесс:
+                    // в журнал, чтобы отказ перезапуска был виден, а не молчал.
+                    Log.e(TAG, "restart:notif startService failed", t)
+                    EventLog.append("restart:notif:start_fail:${t.javaClass.simpleName}")
+                }
+            }
+        }, "wsb-restart").apply { isDaemon = true }.start()
     }
+
+    /// Контур полностью разобран: старт нового поколения не отобьётся guard'ом
+    /// и не подерётся за общие поля со старым.
+    ///
+    /// Читателя проверяем отдельно от `tunIn`: fd обнуляется в closeTun()
+    /// сразу, а поток ещё какое-то время доигрывает catch-break. Именно это
+    /// окно и съедала прежняя фиксированная пауза.
+    private fun isTornDown(): Boolean =
+        !starting && tunIn == null && readThread?.isAlive != true
 
     /// Остановка сервиса. Зовётся и из UI (ACTION_STOP), и сторожем старта.
     private fun stopTunnel() {
@@ -414,6 +478,7 @@ class TunnelService : VpnService() {
             ex.shutdown()
         }
         lwipExecutor = null
+        shutdownDnsForwarder()
         closeTun()
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
@@ -456,7 +521,7 @@ class TunnelService : VpnService() {
     // узким местом — вынести DNS-запись на lwipExecutor.
     @Synchronized
     private fun writePacket(data: ByteArray) {
-        EventLog.outPkts += 1
+        EventLog.outPkts.incrementAndGet()
         try {
             tunOut?.write(data)
         } catch (e: Exception) {
@@ -475,17 +540,17 @@ class TunnelService : VpnService() {
             // Статистика по дням капается событийно — прямо с этого же тика
             // (15с), без отдельных таймеров и без будки батареи (iOS build 91).
             // rxBytes = от клиента, upBytes = к клиенту (см. StatsStore).
-            StatsStore.snapshot(EventLog.rxBytes, EventLog.upBytes)
+            StatsStore.snapshot(EventLog.rxBytes.get(), EventLog.upBytes.get())
             EventLog.append(
-                "io:in=$packetCount out=${EventLog.outPkts} v6=${EventLog.inV6} oth=${EventLog.inOther} " +
-                    "wd=${EventLog.wsDown} wf=${EventLog.writeFails} up=${EventLog.upBytes} rx=${EventLog.rxBytes} " +
-                    "pend=${EventLog.pendCur} sent=${EventLog.sentCb} inmem=${lwip.nativeInmemDrops()} conns=${sessions.size}"
+                "io:in=$packetCount out=${EventLog.outPkts.get()} v6=${EventLog.inV6.get()} oth=${EventLog.inOther.get()} " +
+                    "wd=${EventLog.wsDown.get()} wf=${EventLog.writeFails.get()} up=${EventLog.upBytes.get()} rx=${EventLog.rxBytes.get()} " +
+                    "pend=${EventLog.pendCur.get()} sent=${EventLog.sentCb.get()} inmem=${lwip.nativeInmemDrops()} conns=${sessions.size}"
             )
         }, 15, 15, TimeUnit.SECONDS)
     }
 
     private fun readLoop() {
-        Thread({
+        val t = Thread({
             val buf = ByteArray(32767) // TUN-пакет ≤ MTU
             val input = tunIn ?: return@Thread
             while (!stopped) {
@@ -512,14 +577,19 @@ class TunnelService : VpnService() {
                     handlePacket(packet)
                 }
             }
-        }, "wsb-tun").apply { isDaemon = true }.start()
+        }, "wsb-tun").apply { isDaemon = true }
+        // Публикуем ДО start(): перезапуск должен видеть поток ещё до того, как
+        // он начал читать, иначе окно «потока ещё нет» выглядело бы как
+        // «поток уже умер» — и ждать было бы нечего.
+        readThread = t
+        t.start()
     }
 
     private fun handlePacket(packet: ByteArray) {
         if (packet.size <= 9) return
         val version = (packet[0].toInt() shr 4) and 0xF
         if (version != 4) {
-            EventLog.inV6 += 1
+            EventLog.inV6.incrementAndGet()
             return
         }
         when (packet[9].toInt()) {
@@ -530,9 +600,9 @@ class TunnelService : VpnService() {
                 lwip.nativePoll()
             }
             17 -> { // UDP: DNS форвардим, остальное (QUIC) роняем
-                if (dnsForwarder?.tryHandle(packet) != true) EventLog.inOther += 1
+                if (dnsForwarder?.tryHandle(packet) != true) EventLog.inOther.incrementAndGet()
             }
-            else -> EventLog.inOther += 1
+            else -> EventLog.inOther.incrementAndGet()
         }
     }
 
@@ -586,7 +656,7 @@ class TunnelService : VpnService() {
     /// закрытие сессии в сторе. Идемпотентен — все пути смерти зовут его,
     /// повторный вызов после закрытия ничего не начислит.
     private fun finalizeStats() {
-        StatsStore.snapshot(EventLog.rxBytes, EventLog.upBytes)
+        StatsStore.snapshot(EventLog.rxBytes.get(), EventLog.upBytes.get())
         StatsStore.noteSessionEnd()
     }
 
@@ -597,6 +667,19 @@ class TunnelService : VpnService() {
         runCatching { tunOut?.close() }
         runCatching { dnsFd?.close() }
         tunIn = null; tunOut = null; dnsFd = null
+    }
+
+    /// Гасит пул потоков DNS-форвардера. Вызывать ТОЛЬКО из путей остановки
+    /// сервиса, где поле действительно принадлежит нам.
+    ///
+    /// ponytail: намеренно НЕ в closeTun(). closeTun зовётся ещё и из
+    /// устаревшей попытки старта (`startGen != gen`), где `dnsForwarder`
+    /// могло уже перезаписать НОВОЙ сессией — выключение чужого пула убило бы
+    /// живой DNS у только что поднятого туннеля, причём молча: forwarder
+    /// после shutdown отвечает `false`, и его пакеты уходят в inOther.
+    private fun shutdownDnsForwarder() {
+        runCatching { dnsForwarder?.shutdown() }
+        dnsForwarder = null
     }
 
     override fun onRevoke() {
@@ -617,6 +700,7 @@ class TunnelService : VpnService() {
         stopped = true
         runCatching { lwipExecutor?.shutdownNow() }
         lwipExecutor = null
+        shutdownDnsForwarder()
         closeTun()
         stopSelf()
     }
@@ -634,6 +718,7 @@ class TunnelService : VpnService() {
         NotificationHelper.cancelLongSession(this)
         TunnelManager.updateRunning(false)
         runCatching { lwipExecutor?.shutdownNow() }
+        shutdownDnsForwarder()
         closeTun()
         super.onDestroy()
     }

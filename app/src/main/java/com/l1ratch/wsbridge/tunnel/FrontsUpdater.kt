@@ -61,6 +61,24 @@ object FrontsUpdater {
     private class Stat(var fails: Int, var lastFail: Long, var lastOk: Long)
 
     private lateinit var prefs: SharedPreferences
+
+    /// WP-4: единая блокировка на всё изменяемое состояние реестра.
+    /// Раньше `db` защищался `synchronized(db)`, а `dirty`/`lastFlush`/
+    /// `lastAppliedExtras`/`prefs` — вообще ничем, при том что вход есть из
+    /// двух мест сразу: UI (update из корутины) и старт сервиса
+    /// (TunnelService.startTunnel → FrontsUpdater.init). Два независимых
+    /// лока не давали атомарности между «пометил грязным» и «слил на диск»:
+    /// `dirty = true`, пришедший между проверкой и сбросом флага в
+    /// flushThrottled, терялся — реестр не сохранялся, и выученные фейлы
+    /// фронтов пропадали при следующем рестарте.
+    ///
+    /// Монитор один и он же reentrant, поэтому вложенные захваты
+    /// (init → persist → flushThrottled) безопасны.
+    /// ВАЖНО: `resolves()` (DNS) и `fetch()` (HTTP) — только ВНЕ блокировки.
+    /// Резолв идёт секундами; держа лок на нём, мы останавливали бы запись
+    /// успехов/фейлов из каскада на всё время сетевых операций.
+    private val lock = Any()
+
     private val db = HashMap<String, Stat>()
     private var dirty = false
     private var lastFlush = 0L
@@ -69,7 +87,7 @@ object FrontsUpdater {
     /// «меняем только при изменении» — тот же набор не трогает ни каскад, ни prefs.
     private var lastAppliedExtras: List<String>? = null
 
-    fun init(context: Context) {
+    fun init(context: Context) = synchronized(lock) {
         val first = !::prefs.isInitialized
         if (first) {
             prefs = context.applicationContext.getSharedPreferences("fronts", Context.MODE_PRIVATE)
@@ -137,9 +155,9 @@ object FrontsUpdater {
     /// на нём `db` — значит останавливать запись успехов/фейлов из каскада.
     private fun mergeAlive(upstream: List<String>): String? {
         val now = System.currentTimeMillis()
-        val unknown = synchronized(db) { upstream.filter { it !in db } }
+        val unknown = synchronized(lock) { upstream.filter { it !in db } }
         val fresh = unknown.filter { resolves(it) }
-        val deadInUpstream = synchronized(db) {
+        val deadInUpstream = synchronized(lock) {
             db.entries
                 .filter { it.key in upstream && it.value.fails >= ENTRY_FAIL_LIMIT && it.value.lastOk < now - REVIVE_WINDOW_MS }
                 .map { it.key }
@@ -153,7 +171,7 @@ object FrontsUpdater {
             return "протух: живых 0 из ${upstream.size}"
         }
 
-        synchronized(db) {
+        synchronized(lock) {
             // Новички: добавляются только резолвящиеся. Не-резолвящиеся не
             // попадают в реестр вовсе — их перепроверит следующий апдейт.
             for (d in fresh) if (!db.containsKey(d)) db[d] = Stat(0, 0, now)
@@ -166,8 +184,8 @@ object FrontsUpdater {
                     (st.lastOk == 0L || st.lastOk < now - EVICT_AFTER_MS)
             }
             for (e in evict) db.remove(e.key)
+            dirty = true
         }
-        dirty = true
         applyAlive()
         prefs.edit().putLong("frontsUpdatedAt", now).apply()
         persist()
@@ -178,24 +196,24 @@ object FrontsUpdater {
     /// Чужие ключи (прямые IP, kws*.web.telegram.org) игнорируются — их в реестре нет.
     fun recordSuccess(frontHost: String) {
         val base = baseOf(frontHost) ?: return
-        synchronized(db) {
+        synchronized(lock) {
             val st = db[base] ?: return
             st.fails = 0
             st.lastOk = System.currentTimeMillis()
+            dirty = true
         }
-        dirty = true
         flushThrottled()
     }
 
     /// Фейл фронта в каскаде. Пишется на диск сразу — это самая ценная память.
     fun recordFailure(frontHost: String) {
         val base = baseOf(frontHost) ?: return
-        synchronized(db) {
+        synchronized(lock) {
             val st = db[base] ?: return
             st.fails += 1
             st.lastFail = System.currentTimeMillis()
+            dirty = true
         }
-        dirty = true
         flushThrottled(force = true)
     }
 
@@ -219,19 +237,19 @@ object FrontsUpdater {
 
     /// Экстра-фронт = реестр минус мёртвые. Применяется к CFDomains только
     /// при изменении набора; порядок — свежие успехи первыми.
-    /// Синхронизирован целиком: вызывается из main (init) и IO (update).
-    @Synchronized
     private fun applyAlive() {
         val now = System.currentTimeMillis()
-        val extras = synchronized(db) {
+        val extras = synchronized(lock) {
             db.entries
                 .filter { it.value.fails < ENTRY_FAIL_LIMIT || it.value.lastOk > now - REVIVE_WINDOW_MS }
                 .sortedByDescending { it.value.lastOk }
                 .map { it.key }
         }
-        if (extras != lastAppliedExtras) {
-            CFDomains.update(extras)
-            lastAppliedExtras = extras
+        synchronized(lock) {
+            if (extras != lastAppliedExtras) {
+                CFDomains.update(extras)
+                lastAppliedExtras = extras
+            }
         }
     }
 
@@ -243,7 +261,7 @@ object FrontsUpdater {
     }
 
     private fun loadDb() {
-        synchronized(db) {
+        synchronized(lock) {
             db.clear()
             val json = prefs.getString("frontsDb", null) ?: return
             val arr = try { JSONArray(json) } catch (_: Exception) { return }
@@ -260,40 +278,51 @@ object FrontsUpdater {
     private fun migrateOldList() {
         val old = prefs.getString("fronts", null) ?: return
         val now = System.currentTimeMillis()
-        synchronized(db) {
+        synchronized(lock) {
             for (d in old.lines().map { it.trim() }.filter { it.isNotBlank() }) {
                 if (!db.containsKey(d)) db[d] = Stat(0, 0, now)
             }
+            dirty = true
         }
-        dirty = true
         prefs.edit().remove("fronts").apply()
     }
 
-    @Synchronized
     private fun flushThrottled(force: Boolean = false) {
-        if (!dirty) return
-        if (!force && System.currentTimeMillis() - lastFlush < FLUSH_INTERVAL_MS) return
-        lastFlush = System.currentTimeMillis()
-        val arr = JSONArray()
-        synchronized(db) {
+        synchronized(lock) {
+            if (!dirty) return
+            if (!force && System.currentTimeMillis() - lastFlush < FLUSH_INTERVAL_MS) return
+            lastFlush = System.currentTimeMillis()
+            val arr = JSONArray()
             for ((d, st) in db) {
                 arr.put(JSONObject().apply {
                     put("d", d); put("f", st.fails); put("lf", st.lastFail); put("lo", st.lastOk)
                 })
             }
+            prefs.edit().putString("frontsDb", arr.toString()).apply()
+            // Сброс флага — под тем же локом, что и запись: иначе dirty = true
+            // из recordFailure между снимком и сбросом терялся, и свежие фейлы
+            // не попадали на диск вовсе.
+            dirty = false
         }
-        prefs.edit().putString("frontsDb", arr.toString()).apply()
-        dirty = false
     }
 
     /// Простой HTTP GET с таймаутами: stdlib, без OkHttp-зависимости в UI-слое.
     /// Вызывается по каждому источнику по очереди — перебор в update().
+    ///
+    /// WP-4: заголовки обхода кэша. README обещает «качаем свежий список», а
+    /// HttpURLConnection по умолчанию уважает кэш (и промежуточные прокси тоже):
+    /// после правки апстрима прилетал бы старый файл, и обновление фронтов
+    /// молча не давало бы эффекта. useCaches = false душит кэш самого
+    /// соединения, Cache-Control/Pragma — кэши по пути.
     private fun fetch(url: String): String? {
         val conn = URL(url).openConnection() as HttpURLConnection
         return try {
             conn.connectTimeout = 10_000
             conn.readTimeout = 10_000
             conn.instanceFollowRedirects = true
+            conn.useCaches = false
+            conn.setRequestProperty("Cache-Control", "no-cache, no-store")
+            conn.setRequestProperty("Pragma", "no-cache")
             if (conn.responseCode != 200) return null
             conn.inputStream.bufferedReader().use { it.readText() }
         } finally {

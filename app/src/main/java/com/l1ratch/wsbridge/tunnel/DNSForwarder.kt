@@ -41,12 +41,16 @@ class DNSForwarder(
     private val writePacket: (ByteArray) -> Unit,
 ) {
     /// OkHttpClient для DoH-запросов. Таймауты короткие — DNS должен быть быстрым.
-    private val httpClient: OkHttpClient by lazy {
+    /// Держим явную Lazy (а не `by lazy`), чтобы shutdown() мог отличить
+    /// «клиент так и не понадобился» от «клиент создан и держит сокеты»:
+    /// обращение к нему ради очистки подняло бы его впервые на остановке.
+    private val httpClientLazy = lazy {
         OkHttpClient.Builder()
             .connectTimeout(3, TimeUnit.SECONDS)
             .readTimeout(3, TimeUnit.SECONDS)
             .build()
     }
+    private val httpClient: OkHttpClient by httpClientLazy
 
     /// Пул на всё время жизни форвардера. daemon-потоки: форвардер живёт
     /// столько же, сколько сервис, и не должен удерживать процесс.
@@ -56,9 +60,31 @@ class DNSForwarder(
         Thread(r, "dns-fwd").apply { isDaemon = true }
     }
 
+    /// Форвардер закрыт: весь жизненный цикл кончился. Отдельный флаг, а не
+    /// только `requestPool.isShutdown`, потому что tryHandle зовётся со
+    /// lwIP-потока уже ПОСЛЕ остановки сервиса (кеш пакетов в очереди) — и
+    /// submit в закрытый пул бросил бы RejectedExecutionException в lwIP-поток,
+    /// уронив обработку пакетов вместе с фолбэком. Остановка не должна
+    /// превращаться в исключение на чужом потоке.
+    @Volatile private var closed = false
+
+    /// Закрывает пул потоков форвардера. Вызывается владельцем — TunnelService —
+    /// на любом пути остановки: idempotent, повторный вызов безопасен.
+    ///
+    /// ponytail: shutdownNow() не берём. Задача в полёте — это живой DNS-запрос
+    /// с сокетом и таймаутом в 3с; прерывание потока оставило бы сокет
+    /// недозакрытым ровно в момент смерти сервиса. Дожидаться не нужно:
+    /// потоки daemon, процессу они не мешают, а свой бюджет в 8с они
+    /// доработают сами и тихо завершатся.
+    fun shutdown() {
+        closed = true
+        requestPool.shutdown()
+    }
+
     /// Проверяет, является ли пакет DNS-запросом (UDP:53).
     /// Возвращает true если пакет перехвачен и обработан.
     fun tryHandle(packet: ByteArray): Boolean {
+        if (closed) return false
         if (packet.size <= 28) return false
         val ihl = (packet[0].toInt() and 0x0F) * 4
         if (packet[9].toInt() != 17) return false // UDP

@@ -117,6 +117,7 @@ object TunnelManager {
     private val transitionFmt = SimpleDateFormat("HH:mm:ss", Locale.US)
 
     fun init(context: Context) {
+        if (::prefs.isInitialized) return   // WP-2: идемпотентность — повторный вызов безопасен
         prefs = context.applicationContext.getSharedPreferences("wsbridge", Context.MODE_PRIVATE)
     }
 

@@ -4,6 +4,7 @@ import android.util.Log
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicLong
 
 /// Журнал событий туннеля. На Android сервис и UI живут в ОДНОМ процессе,
 /// поэтому весь IPC-слой iOS (Darwin notifications, JournalServer на
@@ -20,16 +21,19 @@ object EventLog {
     private val entries = ArrayDeque<Pair<String, Long>>()
     private val fmt = SimpleDateFormat("HH:mm:ss", Locale.US)
 
-    // Счётчики io-строки журнала (пишутся в основном с lwip-потока)
-    @Volatile var outPkts = 0L
-    @Volatile var wsDown = 0L
-    @Volatile var writeFails = 0L
-    @Volatile var upBytes = 0L
-    @Volatile var rxBytes = 0L
-    @Volatile var pendCur = 0L
-    @Volatile var sentCb = 0L
-    @Volatile var inV6 = 0L
-    @Volatile var inOther = 0L
+    // WP-3: счётчики io-строки журнала — AtomicLong вместо @Volatile var.
+    // Операция += не атомарна для volatile (read-modify-write из нескольких
+    // потоков теряет инкременты); AtomicLong.addAndGet/incrementAndGet решают
+    // это без явных блокировок. Чтение через .get(), сброс через .set(0).
+    val outPkts   = AtomicLong(0L)
+    val wsDown    = AtomicLong(0L)
+    val writeFails = AtomicLong(0L)
+    val upBytes   = AtomicLong(0L)
+    val rxBytes   = AtomicLong(0L)
+    val pendCur   = AtomicLong(0L)
+    val sentCb    = AtomicLong(0L)
+    val inV6      = AtomicLong(0L)
+    val inOther   = AtomicLong(0L)
 
     @Synchronized
     fun append(name: String) {
@@ -41,8 +45,8 @@ object EventLog {
     @Synchronized
     fun reset() {
         entries.clear()
-        outPkts = 0; wsDown = 0; writeFails = 0; upBytes = 0
-        rxBytes = 0; pendCur = 0; sentCb = 0; inV6 = 0; inOther = 0
+        outPkts.set(0); wsDown.set(0); writeFails.set(0); upBytes.set(0)
+        rxBytes.set(0); pendCur.set(0); sentCb.set(0); inV6.set(0); inOther.set(0)
     }
 
     @Synchronized

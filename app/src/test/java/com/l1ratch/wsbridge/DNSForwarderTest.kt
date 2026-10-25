@@ -2,6 +2,7 @@ package com.l1ratch.wsbridge
 
 import com.l1ratch.wsbridge.tunnel.DNSForwarder
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
@@ -258,6 +259,41 @@ class DNSForwarderTest {
     fun `udp checksum is zero which ipv4 permits`() {
         val out = wrap(ByteArray(8) { 1 })
         assertEquals(0, be16(out, 26))
+    }
+
+    // ── Жизненный цикл (WP-1) ────────────────────────────────────────
+
+    /// После shutdown() форвардер обязан ОТВЕРГАТЬ пакеты, а не пытаться
+    /// отправить их в уже закрытый пул.
+    ///
+    /// Это не косметика: tryHandle зовётся с потока lwIP, то есть на пути
+    /// обработки трафика. `execute` в закрытый пул бросает
+    /// RejectedExecutionException, и оно улетало бы в lwIP-поток уже после
+    /// остановки сервиса — вместе с обработкой всех последующих пакетов.
+    /// Провал этого теста виден как исключение из tryHandle, а не как false:
+    /// ровно то поведение, которого не должно быть.
+    ///
+    /// Тест герметичен намеренно: проверка `closed` стоит ПЕРВОЙ строкой
+    /// tryHandle, поэтому до resolve() дело не доходит и ни SystemClock, ни
+    /// сокеты не нужны (в JVM-тестах android.os.SystemClock не замокан и
+    /// бросил бы "not mocked", пройди мы дальше по коду).
+    @Test
+    fun `tryHandle rejects packets after shutdown`() {
+        val fwd = forwarder()
+        val query = request(dns = dnsQuery())
+
+        fwd.shutdown()
+        assertFalse("после shutdown пакет не перехватывается", fwd.tryHandle(query))
+    }
+
+    /// Повторная остановка — не ошибка. stopTunnel(), onRevoke() и onDestroy()
+    /// сходятся на одном форвардере, и порядок вызовов между ними не определён.
+    @Test
+    fun `shutdown is idempotent`() {
+        val fwd = forwarder()
+        fwd.shutdown()
+        fwd.shutdown()
+        assertFalse(fwd.tryHandle(request(dns = dnsQuery())))
     }
 
     private fun assertArrayEqualsBytes(expected: ByteArray, actual: ByteArray) {

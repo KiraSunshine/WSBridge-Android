@@ -32,8 +32,10 @@ flowchart LR
 
 Unlike the iOS original there is no IPC layer: the service and the UI live
 in one process, so the journal and the status are read directly. lwIP has
-no UDP of its own, so DNS from the tunnel is forwarded by `DNSForwarder`
-as plain UDP:53 to the selected server.
+no UDP of its own, so DNS from the tunnel is intercepted by `DNSForwarder`
+and re-sent over the selected encrypted transport — by default DoT to the
+resolver IP on 853 (plain UDP:53 only for configs with no encrypted
+transport; see [DNS](#dns)).
 
 The 64-byte obfuscated init header is parsed on the fly. The client does
 not embed `dc_idx` into it without a proxy secret, so the DC index is
@@ -154,10 +156,12 @@ the derived `versionCode` would go below an already published preview.
 - iOS delegates encrypted DNS to the system (`NEDNSOverTLSSettings` /
   `NEDNSOverHTTPSSettings`); Android implements both transports in-app —
   DoT as TLS with SNI plus DNS-over-TCP framing, DoH via OkHttp — because
-  the system private DNS is not available to a `VpnService`. Hostname
-  verification is off for DoT: the socket connects to an IP, so the
-  certificate cannot match it; integrity comes from TLS and authenticity
-  from the trusted IP list;
+  the system private DNS is not available to a `VpnService`. DoT hostname
+  verification is **on** (`endpointIdentificationAlgorithm = "HTTPS"`, SNI
+  set from the configured hostname): the TCP socket connects directly to
+  the server IP, but TLS validates the certificate against the hostname,
+  so a trusted-CA certificate cannot impersonate the resolver; authenticity
+  also comes from the trusted IP list;
 - network changes and long-session reminders: iOS watches `NWPathMonitor`
   in the tunnel extension and posts `UNUserNotificationCenter`
   notifications; Android uses `ConnectivityManager` callbacks owned by the

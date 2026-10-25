@@ -34,7 +34,7 @@ class TunnelSession(
 
     /// Данные от клиента (Telegram) через lwIP. Вызывается на lwip-потоке.
     fun handleData(data: ByteArray) {
-        EventLog.rxBytes += data.size
+        EventLog.rxBytes.addAndGet(data.size.toLong())
         // Pipe-режим: собственный CF worker пользователя. Без init-парсинга и
         // сплиттера — сырой поток в WS, worker домостит его до DC:443.
         if (workerDomain != null) {
@@ -140,7 +140,7 @@ class TunnelSession(
     private fun forwardToWS(data: ByteArray) {
         if (!wsConnected) return
         val ws = ws ?: return
-        EventLog.upBytes += data.size
+        EventLog.upBytes.addAndGet(data.size.toLong())
         // ws_data = клиентские данные реально ушли на гейтвей (один раз на сессию).
         if (!dataSent) {
             dataSent = true
@@ -168,7 +168,7 @@ class TunnelSession(
             // Сессия мертва — слот connId мог быть переиспользован новым
             // соединением; запоздалые байты отравят его шифрпоток.
             if (dead) return@queue
-            EventLog.wsDown += data.size
+            EventLog.wsDown.addAndGet(data.size.toLong())
             writeOrQueue(data)
         }
     }
@@ -180,7 +180,7 @@ class TunnelSession(
     private fun writeOrQueue(data: ByteArray): Boolean {
         pending?.let {
             pending = it + data
-            EventLog.pendCur += data.size
+            EventLog.pendCur.addAndGet(data.size.toLong())
             return false
         }
         var off = 0
@@ -191,10 +191,10 @@ class TunnelSession(
                 off = end
                 continue
             }
-            EventLog.writeFails += 1
+            EventLog.writeFails.incrementAndGet()
             val rest = data.copyOfRange(off, data.size)
             pending = rest
-            EventLog.pendCur += rest.size
+            EventLog.pendCur.addAndGet(rest.size.toLong())
             if (wfailLogged < 3) {
                 wfailLogged += 1
                 postEvent("wfail:c$connId:inmem=${bridge.nativeInmemDrops()}")
@@ -206,10 +206,10 @@ class TunnelSession(
 
     /// Освободилось место в send-буфере lwIP — дописываем очередь. На lwip-потоке.
     fun handleSent() {
-        EventLog.sentCb += 1
+        EventLog.sentCb.incrementAndGet()
         val p = pending ?: return
         pending = null
-        EventLog.pendCur = 0 // writeOrQueue пересчитает, если снова ERR_MEM
+        EventLog.pendCur.set(0) // writeOrQueue пересчитает, если снова ERR_MEM
         writeOrQueue(p)
     }
 
