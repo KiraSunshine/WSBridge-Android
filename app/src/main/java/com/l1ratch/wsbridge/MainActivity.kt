@@ -53,6 +53,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.NavigationBarItemDefaults
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
@@ -198,12 +199,16 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-private val Green = Color(0xFF17A05E)
+/// Рабочее состояние: мягкий mint, читается на тёмно-фиолетовом фоне.
+private val Green = Color(0xFF4ADE80)
 /// Предупреждающий акцент: неполная конфигурация, фолбэк транспорта.
-private val Orange = Color(0xFFE08A2E)
-private val Indigo = Color(0xFF1E3A6E)
-private val BottomDark = Color(0xFF040810)
-private val DarkBg = Color(0xFF0D1526)
+private val Orange = Color(0xFFF59E0B)
+/// Глубокий фиолетовый для свечения в покое.
+private val Violet = Color(0xFF3D2A6B)
+/// Основной акцент интерфейса и молнии в выключенном состоянии.
+private val Lavender = Color(0xFF8B7BFF)
+private val BottomDark = Color(0xFF05060F)
+private val DarkBg = Color(0xFF090B1A)
 
 /// Радиус Brush.radialGradient задаётся в пикселях, а не в dp.
 @Composable
@@ -213,17 +218,28 @@ private fun px(dp: Dp): Float = with(LocalDensity.current) { dp.toPx() }
 fun App(onToggle: () -> Unit, onRestart: () -> Unit) {
     // Только тёмная тема (как на iOS): светлую отключили — автоадаптация
     // давала блёклые экраны, а градиенты под светлую ломали контраст.
-    MaterialTheme(colorScheme = darkColorScheme(background = DarkBg, surface = DarkBg)) {
-        var screen by remember { mutableStateOf<Any>("main") }
-        // Системная кнопка «Назад» на любом разделе возвращает на главный экран,
-        // а не закрывает приложение. Внутри разделов свои стрелки «назад» уже есть.
-        BackHandler(enabled = screen != "main") { screen = "main" }
+    MaterialTheme(
+        colorScheme = darkColorScheme(
+            background = DarkBg,
+            surface = DarkBg,
+            primary = Lavender,
+            secondary = Lavender,
+        )
+    ) {
+        // Стек экранов: системная «Назад» идёт по истории, а на главном
+        // завершает работу приложения. Явный переход на главный очищает стек.
+        var history by remember { mutableStateOf(listOf("main")) }
+        val screen = history.last()
+        val navigate: (String) -> Unit = { target ->
+            history = if (target == "main") listOf("main") else history + target
+        }
+        BackHandler(enabled = history.size > 1) { history = history.dropLast(1) }
         when (screen) {
-            "main" -> MainScreen(onToggle = onToggle, onRestart = onRestart, navigate = { screen = it })
-            "dnsManage" -> DnsManageScreen(navigate = { screen = it })
-            "worker" -> WorkerScreen(navigate = { screen = it })
-            "journal" -> JournalScreen(navigate = { screen = it })
-            "about" -> AboutScreen(navigate = { screen = it })
+            "main" -> MainScreen(onToggle = onToggle, onRestart = onRestart, navigate = navigate)
+            "dnsManage" -> DnsManageScreen(navigate = navigate)
+            "worker" -> WorkerScreen(navigate = navigate)
+            "journal" -> JournalScreen(navigate = navigate)
+            "about" -> AboutScreen(navigate = navigate)
         }
     }
 }
@@ -272,7 +288,7 @@ private fun MainScreen(onToggle: () -> Unit, onRestart: () -> Unit, navigate: (S
                 .background(
                     Brush.radialGradient(
                         listOf(
-                            (if (running) Green else Indigo).copy(alpha = 0.55f),
+                            (if (running) Green else Violet).copy(alpha = 0.55f),
                             Color.Transparent,
                         ),
                         radius = px(300.dp),
@@ -444,24 +460,31 @@ private fun MainBottomBar(
     onRefreshFronts: () -> Unit,
     refreshingFronts: Boolean,
 ) {
-    NavigationBar(containerColor = Color(0xF20D1526)) {
+    val itemColors = NavigationBarItemDefaults.colors(
+        unselectedIconColor = Lavender.copy(alpha = 0.85f),
+        unselectedTextColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.72f),
+    )
+    NavigationBar(containerColor = DarkBg.copy(alpha = 0.95f)) {
         NavigationBarItem(
             selected = false,
             onClick = onJournal,
             icon = { Icon(Icons.Default.Info, null) },
             label = { Text("Журнал") },
+            colors = itemColors,
         )
         NavigationBarItem(
             selected = false,
             onClick = onDns,
             icon = { Icon(Icons.Default.NetworkWifi, null) },
             label = { Text("DNS") },
+            colors = itemColors,
         )
         NavigationBarItem(
             selected = false,
             onClick = onWorker,
             icon = { Icon(Icons.Default.Cloud, null) },
             label = { Text("Worker") },
+            colors = itemColors,
         )
         NavigationBarItem(
             selected = false,
@@ -474,6 +497,7 @@ private fun MainBottomBar(
                 }
             },
             label = { Text("Фронты") },
+            colors = itemColors,
         )
     }
 }
@@ -491,7 +515,7 @@ private fun BoltButton(running: Boolean, onToggle: () -> Unit) {
                     listOf(
                         // В покое — приглушённый индиго (не серый: серый читался
                         // как «сломано»), при работе — зелёное свечение.
-                        (if (running) Green else Indigo).copy(alpha = if (running) 0.35f else 0.16f),
+                        (if (running) Green else Violet).copy(alpha = if (running) 0.35f else 0.22f),
                         Color.Transparent,
                     ),
                     radius = px(120.dp),
@@ -503,7 +527,7 @@ private fun BoltButton(running: Boolean, onToggle: () -> Unit) {
         Icon(
             Icons.Default.Bolt,
             contentDescription = if (running) "Выключить туннель" else "Включить туннель",
-            tint = if (running) Green else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.45f),
+            tint = if (running) Green else Lavender,
             modifier = Modifier.size(170.dp),
         )
     }
