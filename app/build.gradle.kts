@@ -15,16 +15,20 @@ android {
     compileSdk = (project.findProperty("wsb.compileSdk") as String?)?.toIntOrNull()
         ?: libs.versions.android.compileSdk.get().toInt()
 
-    // ── Версия: ДВА числа, источник — gradle.properties ───────────────
-    // wsb.build  — номер сборки, монотонный, кормит versionCode. CI
-    //              передаёт BUILD_NUMBER = wsb.build, так что max() —
-    //              защита от случайного расхождения, а не источник.
-    // wsb.version — маркетинговая semver (0.3.0), кормит versionName и
-    //              проверку тега релиза; от номера сборки НЕ зависит.
-    val wsbBuild = (project.findProperty("wsb.build") as String?)?.toIntOrNull() ?: 1
+    // ── Версия: ОДНА строка X.X.N из gradle.properties ────────────────
+    // X.X — блок версии, N — номер сборки внутри блока (0.3.0 = 0.3, сборка 0).
+    // Отдельной переменной для сборки нет — она уже в строке, поэтому UI и
+    // тег релиза показывают одно значение.
+    //
+    // versionCode выводим из этой же строки: major*1e6 + minor*1e4 + patch.
+    // 0.3.0 → 30000, 0.3.1 → 30001, 0.4.0 → 40000 — номер всегда растёт,
+    // а значит обновление поверх установленного проходит.
     val wsbVersion = (project.findProperty("wsb.version") as String?) ?: "0.0.0"
-    val ciBuild = System.getenv("BUILD_NUMBER")?.toIntOrNull() ?: 0
-    val buildNo = maxOf(wsbBuild, ciBuild)
+    val vParts = wsbVersion.split(".").map { it.toIntOrNull() ?: 0 }
+    val versionCodeValue =
+        (vParts.getOrElse(0) { 0 }) * 1_000_000 +
+            (vParts.getOrElse(1) { 0 }) * 10_000 +
+            (vParts.getOrElse(2) { 0 })
     // Нативная сборка выключается ключом -Pwsb.native=false (по умолчанию — вкл).
     val nativeBuild = (project.findProperty("wsb.native") as String?) != "false"
 
@@ -32,9 +36,8 @@ android {
         applicationId = "com.l1ratch.wsbridge"
         minSdk = libs.versions.android.minSdk.get().toInt()
         targetSdk = libs.versions.android.targetSdk.get().toInt()
-        versionCode = buildNo
-        // Маркетинговая версия отдельно от номера сборки: numberCode в UI
-        // не дублирует, тег релиза совпадает с versionName.
+        versionCode = versionCodeValue
+        // В UI и теге релиза — ровно эта строка, без скобок и номеров рядом.
         versionName = wsbVersion
         if (nativeBuild) {
             ndk {

@@ -123,14 +123,15 @@ manual uninstall — those were signed with a random key.)
 
 ## Build
 
-Version is two values in `gradle.properties`: `wsb.build` — the monotonic
-build number that drives `versionCode`, and `wsb.version` — the marketing
-semver (`0.3.0`) that drives `versionName`. Both CI workflows pass
-`wsb.build` as `BUILD_NUMBER`, so preview and release builds share one
-growing `versionCode` and install over each other. The release workflow
-refuses to build when the pushed tag (`v0.3.0`) disagrees with `wsb.version`,
-or when `wsb.build` would go below an already published preview — so bump
-`wsb.build` on every push and set `wsb.version` deliberately on releases.
+Version is a single string, `wsb.version` in `gradle.properties`, written as
+`X.X.N`: `X.X` is the version block and `N` is the build number (`0.3.0`
+means version 0.3, build 0). That string is `versionName` verbatim — no
+build number in parentheses and no second variable. `versionCode` is derived
+from it (`major*1e6 + minor*1e4 + patch`, so `0.3.0` → `30000`); since
+Android only installs an APK with a higher `versionCode`, a new block always
+outranks every build of the previous one. The release workflow refuses to
+build when the pushed tag (`v0.3.0`) disagrees with `wsb.version`, or when
+the derived `versionCode` would go below an already published preview.
 
 - Gradle wrapper; CI (GitHub Actions) builds a signed APK on every push
   to `main` and publishes it to the `preview` prerelease.

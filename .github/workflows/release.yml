@@ -2,10 +2,11 @@ name: Release (Tag v*)
 
 # Релизный сборщик. Запускается ТОЛЬКО пушем тега v0.3.0 и т.п.
 # Создаёт GitHub Release с подписанным APK.
-# Версия — ДВА числа из gradle.properties: wsb.build (монотонный номер
-# сборки → versionCode) и wsb.version (маркетинговая semver → versionName
-# и тег релиза). Тег обязан совпадать с wsb.version, а versionCode — не
-# откатываться ниже опубликованного preview, иначе job падает до сборки.
+# Версия — ОДНА строка X.X.N из gradle.properties (X.X — блок версии,
+# N — номер сборки), как на iOS. Из неё же выводится versionCode
+# (major*1e6 + minor*1e4 + patch). Тег обязан совпадать с wsb.version,
+# а versionCode — не откатываться ниже опубликованного preview, иначе
+# job падает до сборки.
 # Подпись: RELEASE_KEYSTORE_B64 + RELEASE_KEYSTORE_PASSWORD + RELEASE_KEY_ALIAS
 # + RELEASE_KEY_PASSWORD в секретах; без них — debug-ключ (ставится, но не для
 # обновления поверх старых релизных сборок).
@@ -25,26 +26,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ── Версия: ДВА числа, источник — gradle.properties ──────────────
-      # wsb.build → versionCode (max с BUILD_NUMBER в Gradle; CI передаёт
-      # BUILD_NUMBER = wsb.build, так что совпадает точно). wsb.version →
-      # versionName. Значит тег релиза описывает versionName, а монотонность
-      # versionCode держится на wsb.build.
+      # ── Версия: ОДНА строка X.X.N из gradle.properties ───────────────
+      # X.X — блок версии, N — номер сборки (0.3.0 = 0.3, сборка 0).
+      # versionCode выводится из неё же — отдельного счётчика нет.
+      # Проверяем формат явно: опечатка иначе молча дала бы versionCode 0.
       - name: Read version
         id: ver
         run: |
           set -euo pipefail
-          BUILD=$(grep -E '^[[:space:]]*wsb\.build[[:space:]]*=' gradle.properties | tail -n 1 | cut -d= -f2 | tr -d '[:space:]' || true)
-          case "$BUILD" in
-            ''|*[!0-9]*) echo "::error::wsb.build не найден или не число в gradle.properties"; exit 1 ;;
-          esac
           VERSION=$(grep -E '^[[:space:]]*wsb\.version[[:space:]]*=' gradle.properties | tail -n 1 | cut -d= -f2 | tr -d '[:space:]' || true)
-          case "$VERSION" in
-            ''|*[!0-9A-Za-z.\-+]*) echo "::error::wsb.version не найден в gradle.properties"; exit 1 ;;
-          esac
-          echo "build=$BUILD" >> "$GITHUB_OUTPUT"
+          if ! printf '%s' "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::wsb.version в gradle.properties должен быть X.X.N (например 0.3.0), получено: '$VERSION'"
+            exit 1
+          fi
+          IFS='.' read -r MAJ MIN PAT <<< "$VERSION"
+          CODE=$(( MAJ * 1000000 + MIN * 10000 + PAT ))
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "wsb.build=$BUILD → versionCode $BUILD; wsb.version=$VERSION → versionName"
+          echo "code=$CODE" >> "$GITHUB_OUTPUT"
+          echo "versionName=$VERSION, versionCode=$CODE"
 
       # Тег обязан совпадать с МАРКЕТИНГОВОЙ версией из файла (порт iOS
       # build 109: «Check tag matches WSB_VERSION»). Версия берётся ИЗ
@@ -70,23 +69,23 @@ jobs:
           echo "OK: тег $TAG_REF = wsb.version $EXPECTED"
 
       # versionCode не должен откатываться назад: Android отказывает в
-      # установке APK с меньшим номером. Релиз и preview живут в ОДНОЙ
-      # нумерации (оба берут wsb.build), поэтому источник для сравнения —
-      # последняя опубликованная preview: build-маркер в её описании
-      # («build N», пишет build.yml). Маркера нет (первый релиз после
-      # смены схемы) — проверка пропускается.
+      # установке APK с меньшим номером. Релиз и preview выводят versionCode
+      # из одной и той же wsb.version, поэтому источник для сравнения —
+      # последняя опубликованная preview: маркер «code N» в её описании
+      # (пишет build.yml). Маркера нет (первый релиз после смены схемы) —
+      # проверка пропускается.
       - name: Check versionCode is not a downgrade
         env:
-          BUILD: ${{ steps.ver.outputs.build }}
+          CODE: ${{ steps.ver.outputs.code }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          PREV=$(gh release view preview --json body --jq .body 2>/dev/null | grep -oE 'build [0-9]+' | grep -oE '[0-9]+' | tail -n 1 || true)
-          if [ -n "$PREV" ] && [ "$BUILD" -lt "$PREV" ]; then
-            echo "::error::wsb.build=$BUILD меньше опубликованной preview (build $PREV) — обновление поверх будет отбито Android. Поднимите wsb.build минимум до $PREV."
+          PREV=$(gh release view preview --json body --jq .body 2>/dev/null | grep -oE 'code [0-9]+' | grep -oE '[0-9]+' | tail -n 1 || true)
+          if [ -n "$PREV" ] && [ "$CODE" -lt "$PREV" ]; then
+            echo "::error::versionCode $CODE меньше опубликованной preview (code $PREV) — обновление поверх будет отбито Android. Поднимите номер сборки в wsb.version (X.X.N) минимум до версии с code $PREV."
             exit 1
           fi
-          echo "OK: versionCode $BUILD (preview: ${PREV:-нет маркера})"
+          echo "OK: versionCode $CODE (preview: ${PREV:-нет маркера})"
 
       - name: Set up JDK 21
         uses: actions/setup-java@v5
@@ -104,11 +103,9 @@ jobs:
 
       - name: Unit tests + Build release APK
         env:
-          # BUILD_NUMBER жёстко равен wsb.build, а не github.run_number:
-          # Gradle берёт max(wsb.build, BUILD_NUMBER), поэтому большее
-          # значение развело бы versionCode релиза с тегом и с номером
-          # preview-сборок — и обновление поверх перестало бы ставиться.
-          BUILD_NUMBER: ${{ steps.ver.outputs.build }}
+          # BUILD_NUMBER больше не задаём: versionCode выводится в Gradle из
+          # wsb.version, поэтому релиз и preview с одной версией всегда несут
+          # один и тот же номер.
           RELEASE_KEYSTORE_B64: ${{ secrets.RELEASE_KEYSTORE_B64 }}
           RELEASE_KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
           RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
