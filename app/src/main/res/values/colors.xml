@@ -2,4 +2,6 @@
 <resources>
     <!-- Тот же фон, что и DarkBg в Compose: без чёрной вспышки при старте. -->
     <color name="window_background">#090B1A</color>
+    <!-- Фон adaptive-иконки: тёмно-фиолетовый, как основной фон приложения. -->
+    <color name="ic_launcher_background">#090B1A</color>
 </resources>
