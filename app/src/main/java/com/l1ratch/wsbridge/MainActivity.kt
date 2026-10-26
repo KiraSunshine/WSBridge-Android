@@ -52,7 +52,6 @@ import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.NetworkWifi
-import androidx.compose.material.icons.filled.OpenInBrowser
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -447,7 +446,6 @@ private fun OtherPage(
     onUpdateFronts: () -> Unit,
     navigate: (String) -> Unit,
 ) {
-    val ctx = LocalContext.current
     val dns = TunnelManager.selectedDNS
     val worker = TunnelManager.workerDomain.trim()
     Column(
@@ -490,15 +488,6 @@ private fun OtherPage(
         SectionLabel("Приложение")
         OtherRow(Icons.Default.Info, "О программе", "Версия, ссылки, лицензия") {
             navigate("about")
-        }
-
-        Spacer(Modifier.height(18.dp))
-        SectionLabel("Ссылки")
-        OtherRow(Icons.Default.OpenInBrowser, "Исходный код", "github.com/l1ratch/WSBridge-Android") {
-            ctx.openUrl("https://github.com/l1ratch/WSBridge-Android")
-        }
-        OtherRow(Icons.Default.OpenInBrowser, "Исходная логика", "github.com/Flowseal/tg-ws-proxy") {
-            ctx.openUrl("https://github.com/Flowseal/tg-ws-proxy")
         }
     }
 }
