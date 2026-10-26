@@ -31,6 +31,9 @@ android {
             (vParts.getOrElse(2) { 0 })
     // Нативная сборка выключается ключом -Pwsb.native=false (по умолчанию — вкл).
     val nativeBuild = (project.findProperty("wsb.native") as String?) != "false"
+    // Тестовая сборка ставится рядом с обычной: другой applicationId и суффикс версии.
+    // Включается только явно: -Pwsb.testAppId=true.
+    val testAppId = (project.findProperty("wsb.testAppId") as String?) == "true"
 
     defaultConfig {
         applicationId = "com.l1ratch.wsbridge"
@@ -39,6 +42,7 @@ android {
         versionCode = versionCodeValue
         // В UI и теге релиза — ровно эта строка, без скобок и номеров рядом.
         versionName = wsbVersion
+        manifestPlaceholders["appLabel"] = "WSBridge"
         if (nativeBuild) {
             ndk {
                 abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
@@ -89,6 +93,18 @@ android {
                 signingConfigs.getByName("release")
             } else {
                 signingConfigs.getByName("debug")
+            }
+            if (testAppId) {
+                applicationIdSuffix = ".test"
+                versionNameSuffix = "-test"
+                manifestPlaceholders["appLabel"] = "WSBridge Test"
+            }
+        }
+        getByName("debug") {
+            if (testAppId) {
+                applicationIdSuffix = ".test"
+                versionNameSuffix = "-test"
+                manifestPlaceholders["appLabel"] = "WSBridge Test"
             }
         }
     }

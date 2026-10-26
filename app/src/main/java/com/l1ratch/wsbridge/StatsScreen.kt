@@ -50,8 +50,8 @@ import java.util.Locale
 /// Палитру дублируем локально (Green/Orange из MainActivity private):
 /// графике нужны те же акценты, а таскать сквозной файл темы ради двух
 /// прямоугольников — оверкилл.
-private val ChartDown = Color(0xFF17A05E) // к клиенту: зелёный = «скачивание»
-private val ChartUp = Color(0xFFE08A2E)   // от клиента: тёплый = «отдаём»
+private val ChartDown = Color(0xFF4ADE80) // к клиенту: mint = «скачивание»
+private val ChartUp = Color(0xFFF59E0B)   // от клиента: тёплый = «отдаём»
 
 /// Байты в человекочитаемом виде. Locale.US принудительно: "%.1f" в
 /// ru-локали даёт запятую, и «1,5 ГБ» в UI выглядит опечаткой на фоне

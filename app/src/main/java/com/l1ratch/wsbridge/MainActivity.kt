@@ -230,12 +230,15 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-private val Green = Color(0xFF17A05E)
+/// Рабочее состояние: мягкий mint, читается на тёмно-фиолетовом фоне.
+private val Green = Color(0xFF4ADE80)
 /// Предупреждающий акцент: неполная конфигурация, фолбэк транспорта.
-private val Orange = Color(0xFFE08A2E)
-private val Indigo = Color(0xFF1E3A6E)
-private val BottomDark = Color(0xFF040810)
-private val DarkBg = Color(0xFF0D1526)
+private val Orange = Color(0xFFF59E0B)
+/// Глубокий фиолетовый для свечения в покое.
+private val Violet = Color(0xFF3D2A6B)
+/// Основной акцент интерфейса и молнии в выключенном состоянии.
+private val Lavender = Color(0xFF8B7BFF)
+private val DarkBg = Color(0xFF090B1A)
 
 /// Радиус Brush.radialGradient задаётся в пикселях, а не в dp.
 @Composable
@@ -245,15 +248,30 @@ private fun px(dp: Dp): Float = with(LocalDensity.current) { dp.toPx() }
 fun App(onToggle: () -> Unit, onRestart: () -> Unit) {
     // Только тёмная тема (как на iOS): светлую отключили — автоадаптация
     // давала блёклые экраны, а градиенты под светлую ломали контраст.
-    MaterialTheme(colorScheme = darkColorScheme(background = DarkBg, surface = DarkBg)) {
+    MaterialTheme(
+        colorScheme = darkColorScheme(
+            background = DarkBg,
+            surface = DarkBg,
+            primary = Lavender,
+            secondary = Lavender,
+        )
+    ) {
         var screen by remember { mutableStateOf<Any>("main") }
+        // Состояние страниц живёт над экранами: вернувшись из журнала или DNS,
+        // пользователь попадает на ту же страницу «Другое», откуда ушёл.
+        val pagerState = rememberPagerState(pageCount = { 2 })
         // Системный «назад» из подраздела — на главную, а не выход из
         // приложения. В подразделах свайп страниц не работает (это отдельные
         // экраны), поэтому жест назад — единственный путь обратно; так же
         // ведёт себя кнопка-стрелка в тулбаре.
         BackHandler(enabled = screen != "main") { screen = "main" }
         when (screen) {
-            "main" -> MainScreen(onToggle = onToggle, onRestart = onRestart, navigate = { screen = it })
+            "main" -> MainScreen(
+                onToggle = onToggle,
+                onRestart = onRestart,
+                navigate = { screen = it },
+                pagerState = pagerState,
+            )
             "dnsManage" -> DnsManageScreen(navigate = { screen = it })
             "worker" -> WorkerScreen(navigate = { screen = it })
             "journal" -> JournalScreen(navigate = { screen = it })
@@ -264,7 +282,12 @@ fun App(onToggle: () -> Unit, onRestart: () -> Unit) {
 }
 
 @Composable
-private fun MainScreen(onToggle: () -> Unit, onRestart: () -> Unit, navigate: (String) -> Unit) {
+private fun MainScreen(
+    onToggle: () -> Unit,
+    onRestart: () -> Unit,
+    navigate: (String) -> Unit,
+    pagerState: PagerState,
+) {
     val running = TunnelManager.running
     var showDns by remember { mutableStateOf(false) }
     // Ручное обновление фронтов: null = не идёт, "run" = качает, "ok:N"/"stale:…"/"offline" = итог.
@@ -293,7 +316,7 @@ private fun MainScreen(onToggle: () -> Unit, onRestart: () -> Unit, navigate: (S
     // точки внизу показывают, где ты и куда можно листнуть. Подразделы
     // (DNS, журнал, статистика…) — отдельные экраны, поэтому внутри них
     // свайпа страниц нет: работает только «назад» (жест или стрелка).
-    val pagerState = rememberPagerState(pageCount = { 2 })
+    // Сам pagerState поднят в App, чтобы страница переживала переход в раздел.
     val scope = rememberCoroutineScope()
 
     // Системный «назад» со второй страницы — на главную, а не выход из
@@ -386,7 +409,7 @@ private fun MainScreen(onToggle: () -> Unit, onRestart: () -> Unit, navigate: (S
 /// всю ширину гладкий: нет ни ступенек, ни границ бокса.
 @Composable
 private fun BackgroundGlow(running: Boolean) {
-    val accent = if (running) Green else Indigo
+    val accent = if (running) Green else Violet
     Box(
         Modifier
             .fillMaxWidth()
@@ -585,7 +608,7 @@ private fun PageDots(state: PagerState, modifier: Modifier = Modifier) {
 /// стоит ДО clickable (ripple режется кругом), плюс лёгкое сжатие на нажатие.
 @Composable
 private fun BoltButton(running: Boolean, onToggle: () -> Unit) {
-    val accent = if (running) Green else Indigo
+    val accent = if (running) Green else Violet
     val interaction = remember { MutableInteractionSource() }
     val pressed by interaction.collectIsPressedAsState()
     val scale by animateFloatAsState(if (pressed) 0.94f else 1f, tween(120), label = "boltScale")
@@ -630,7 +653,7 @@ private fun BoltButton(running: Boolean, onToggle: () -> Unit) {
             Icon(
                 Icons.Default.Bolt,
                 contentDescription = if (running) "Выключить туннель" else "Включить туннель",
-                tint = if (running) Green else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.45f),
+                tint = if (running) Green else Lavender,
                 modifier = Modifier.size(170.dp),
             )
         }
