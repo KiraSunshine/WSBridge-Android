@@ -457,9 +457,6 @@ private fun OtherPage(
             .padding(horizontal = 20.dp)
             .padding(top = 28.dp, bottom = 8.dp),
     ) {
-        Text("Другое", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
-        Spacer(Modifier.height(20.dp))
-
         SectionLabel("Туннель")
         OtherRow(Icons.AutoMirrored.Filled.List, "Журнал туннеля", "События и ошибки текущей сессии") {
             navigate("journal")
